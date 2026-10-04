@@ -1,0 +1,152 @@
+---
+title: "Target Tickers: 82 Symbols with Full Candle Coverage"
+sidebarTitle: "Target Tickers"
+description: "The 82 USDT trading pairs that have gap-free Binance spot 1-minute candle coverage across the full backtest range from 7 May 2021 to 30 September 2026."
+---
+
+The file `assets/target_tickers.txt` at the repository root lists the 82 Binance spot trading pairs that can be used reliably across the entire backtest range. It is the gating list for any strategy replay: before running a backtest on a signal, verify that its ticker appears in this file. Signals for tickers outside the list cannot be evaluated because the corresponding minute-level candle data either does not start early enough or contains gaps that would produce incorrect PnL trajectories.
+
+## Selection criteria
+
+`scripts/check_candles.mjs` was run against all 131 USDT pairs that appeared in the channel's signal history and were still active on Binance spot at the time of the check. A symbol qualified if it met **all three** conditions:
+
+1. **Early listing** — first available 1-minute candle no later than 7 May 2021, the start of the backtest range.
+2. **No internal gaps** — no missing candle windows anywhere between 7 May 2021 and 30 September 2026.
+3. **Still active** — the pair was live on Binance spot at check time (verified using daily candles via `ccxt` as a proxy for minute-level availability).
+
+### What was excluded
+
+- **48 later listings** — symbols first listed after 7 May 2021, including APT, ARB, OP, NOT, JUP, WLD, SEI, and others.
+- **CVC** — had an internal gap in December 2022 that would break the PnL calculation at that point.
+
+131 symbols checked → **82 qualified**.
+
+## The 82 symbols
+
+```text
+1INCHUSDT
+AAVEUSDT
+ADAUSDT
+ALGOUSDT
+ALICEUSDT
+ANKRUSDT
+ARPAUSDT
+ATOMUSDT
+AUDIOUSDT
+AVAUSDT
+AVAXUSDT
+AXSUSDT
+BANDUSDT
+BATUSDT
+BCHUSDT
+BELUSDT
+BNBUSDT
+CAKEUSDT
+CELOUSDT
+CELRUSDT
+CFXUSDT
+CHRUSDT
+CHZUSDT
+CKBUSDT
+COMPUSDT
+COTIUSDT
+CRVUSDT
+CTKUSDT
+CTSIUSDT
+DASHUSDT
+DGBUSDT
+DOGEUSDT
+DOTUSDT
+DUSKUSDT
+EGLDUSDT
+ENJUSDT
+ETCUSDT
+ETHUSDT
+FILUSDT
+GRTUSDT
+HBARUSDT
+HOTUSDT
+INJUSDT
+IOSTUSDT
+IOTAUSDT
+IOTXUSDT
+KAVAUSDT
+KNCUSDT
+KSMUSDT
+LINKUSDT
+LTCUSDT
+MANAUSDT
+MTLUSDT
+NEARUSDT
+NEOUSDT
+ONEUSDT
+ONTUSDT
+QTUMUSDT
+RLCUSDT
+ROSEUSDT
+RSRUSDT
+RUNEUSDT
+RVNUSDT
+SANDUSDT
+SFPUSDT
+SKLUSDT
+SNXUSDT
+SOLUSDT
+SUSHIUSDT
+THETAUSDT
+TLMUSDT
+TRBUSDT
+TRXUSDT
+UNIUSDT
+VETUSDT
+XLMUSDT
+XRPUSDT
+XTZUSDT
+YFIUSDT
+ZECUSDT
+ZENUSDT
+ZRXUSDT
+```
+
+## Cross-referencing against signals.jsonl
+
+`signals.jsonl` files across the dataset reference tickers that are **not** in `target_tickers.txt` — the LLM extracted a verdict for them, but their candle history starts too late or contains gaps. Always cross-reference before backtesting.
+
+```javascript
+import { readFileSync, createReadStream } from "fs";
+import { createInterface } from "readline";
+
+// Build a fast-lookup Set from the ticker list
+const targetTickers = new Set(
+  readFileSync("assets/target_tickers.txt", "utf8")
+    .split("\n")
+    .map((t) => t.trim())
+    .filter(Boolean)
+);
+
+// Filter signals to only backtest-safe pairs
+const rl = createInterface({
+  input: createReadStream("content/apr_2024/assets/signals.jsonl"),
+  crlfDelay: Infinity,
+});
+
+for await (const line of rl) {
+  if (!line.trim()) continue;
+
+  const record = JSON.parse(line);
+
+  if (record.entry.position === "wait") continue;
+  if (!targetTickers.has(record.symbol)) continue; // skip — no candle coverage
+
+  // Safe to backtest
+  console.log(record.entry.position, record.symbol);
+}
+```
+
+<Tip>
+  If you extend the backtest range beyond 30 September 2026 or need to add a
+  new exchange, re-run `scripts/check_candles.mjs` to regenerate
+  `target_tickers.txt`. The script reads its date range from
+  `config/loader.config.ts` in the parent `backtest-kit` project and requires
+  `ccxt` and a Binance API key in the environment.
+</Tip>

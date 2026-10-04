@@ -1,47 +1,181 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Signal Dataset"
+sidebarTitle: "Quickstart"
+description: "Clone the repo, pull LFS data, install dependencies, and run signal extraction for a single month or all 65 months using Node.js and Ollama."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through everything needed to get Signal Dataset running locally: cloning the repository, pulling the LFS-backed data files, installing the Node.js dependencies, starting the required Ollama model, and generating structured signals from raw Telegram posts — first for a single month, then for the full 65-month archive.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, make sure the following are available on your machine:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Node.js** — any modern LTS release (v18 or later recommended)
+- **Git LFS** — must be installed and initialised (`git lfs install`) before cloning
+- **Ollama** — running locally and able to serve the `gemma4:31b-cloud` model; see [ollama.com](https://ollama.com) for installation instructions
 
-## Get started
+## Setup and generation
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Clone the repository">
+    Clone the repository and enter the project directory.
 
     ```bash
-    npm install your-package
+    git clone https://github.com/backtest-kit/signal-dataset.git
+    cd signal-dataset
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Pull LFS data">
+    The `content/` directory — all `messages.jsonl` and `signals.jsonl` files — is stored in Git LFS. After cloning you will have pointer stubs instead of real files until you pull the actual objects.
 
     ```bash
-    your-cli init
+    git lfs pull
     ```
+
+    <Note>
+      This downloads approximately **420 MB** of data. The transfer time depends on your connection. Once complete, every monthly folder under `content/` will contain its full `messages.jsonl` and `signals.jsonl` (where signals exist).
+    </Note>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Install dependencies">
+    Install the Node.js packages required by the extraction pipeline.
 
     ```bash
-    your-cli start
+    npm install
     ```
+
+    This installs the following production dependencies declared in `package.json`:
+
+    | Package | Version | Role |
+    |---|---|---|
+    | `json-inference` | 1.1.0 | Structured LLM output via Ollama with JSON schema enforcement |
+    | `mustache` | 4.2.0 | Renders `prompt.mustache` templates for each month |
+    | `ollama` | 0.6.3 | Ollama HTTP client used by `json-inference` |
+    | `sharp` | 0.35.4 | Decodes base64 JPEG photos attached to posts |
+    | `telegram-reader` | 1.4.0 | Telegram channel scraper used by the fetch helpers |
   </Step>
+
+  <Step title="Start Ollama and pull the model">
+    The extraction pipeline calls Ollama locally. If Ollama is not already running, start it, then pull the required model:
+
+    ```bash
+    ollama pull gemma4:31b-cloud
+    ```
+
+    Once the pull completes, verify the model is available:
+
+    ```bash
+    ollama list
+    ```
+
+    You should see `gemma4:31b-cloud` in the output before proceeding.
+  </Step>
+
+  <Step title="Generate signals for one month">
+    Each monthly folder contains its own self-contained `generate-signals.mjs` script. Run the one for April 2024 to test your setup:
+
+    ```bash
+    node content/apr_2024/generate-signals.mjs
+    ```
+
+    The script streams `assets/messages.jsonl`, applies the keyword pre-filter, extracts candidate tickers from hashtags, and submits each (post, ticker) pair to the LLM using that month's `prompt.mustache`. Verdicts are appended to `assets/signals.jsonl` as they arrive.
+
+    Console output follows this format for each processed pair:
+
+    ```
+    [1/47] id=6588 BTCUSDT -> long
+    [2/47] id=6589 ETHUSDT -> wait
+    [3/47] id=6590 CFXUSDT -> short
+    ```
+
+    <Note>
+      The script is **resumable**. Every `(messageId, symbol)` pair already present in `signals.jsonl` is skipped on re-run, so you can safely interrupt and restart without duplicating records or wasting LLM calls.
+    </Note>
+  </Step>
+
+  <Step title="Run all 65 months">
+    To process the full archive, use the provided batch scripts. There are two modes: a single sequential run, or ten pre-split shards that can be launched in parallel across multiple terminals or machines.
+
+    <CodeGroup>
+
+    ```bash Linux — sequential
+    # Process all 65 months in chronological order
+    ./scripts/linux/generate_test_all.sh
+    ```
+
+    ```bash Linux — parallel shards
+    # Run each shard in a separate terminal for faster throughput
+    ./scripts/linux/generate_test_1.sh
+    ./scripts/linux/generate_test_2.sh
+    # … up to
+    ./scripts/linux/generate_test_10.sh
+    ```
+
+    ```batch Windows — sequential
+    REM Process all 65 months in chronological order
+    scripts\win\generate_test_all.bat
+    ```
+
+    ```batch Windows — parallel shards
+    REM Open a separate Command Prompt for each shard
+    scripts\win\generate_test_1.bat
+    scripts\win\generate_test_2.bat
+    REM … up to
+    scripts\win\generate_test_10.bat
+    ```
+
+    </CodeGroup>
+
+    Because every script is resumable, you can mix sequential and parallel runs freely — shards will never write duplicate records for pairs that another shard already completed.
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Reading signals from the generated files
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+Once generation is complete, `signals.jsonl` files are ready to consume. Stream them line by line — never load a whole file into memory.
+
+<Warning>
+`messages.jsonl` files embed attached images as **base64-encoded JPEGs** in the `photo` field. A single file can be hundreds of megabytes when inflated. Always read these files as a stream, one line at a time. Loading an entire `messages.jsonl` with `JSON.parse(fs.readFileSync(...))` will exhaust available memory.
+</Warning>
+
+The following example streams `signals.jsonl` for a given month, parses each line, and filters out `wait` verdicts so only actionable `long` and `short` signals remain:
+
+```javascript
+import { createReadStream } from 'fs';
+import { createInterface } from 'readline';
+
+const month = 'apr_2024';
+const filePath = `content/${month}/assets/signals.jsonl`;
+
+const rl = createInterface({
+  input: createReadStream(filePath),
+  crlfDelay: Infinity,
+});
+
+for await (const line of rl) {
+  if (!line.trim()) continue;
+
+  const record = JSON.parse(line);
+
+  // Skip result reports, news, and analysis posts
+  if (record.entry.position === 'wait') continue;
+
+  const { messageId, symbol } = record;
+  const { position, entryRange, targets, stoploss } = record.entry;
+
+  console.log(`${messageId} ${symbol} ${position.toUpperCase()}`);
+  console.log(`  Entry : ${entryRange.from} – ${entryRange.to}`);
+  console.log(`  Targets: ${targets.join(', ')}`);
+  console.log(`  Stop  : ${stoploss || 'not stated'}`);
+}
+```
+
+A few things to keep in mind when consuming the data:
+
+- `entry.position` is always one of `"long"`, `"short"`, or `"wait"`. All three are stored; consumers are responsible for filtering.
+- Missing numeric values are encoded as **zeros**: an `entryRange` of `{ "from": 0, "to": 0 }` means a market entry with no stated range; `stoploss: 0` means no stop was given in the post.
+- `message` in each record is the source post text without the photo, safe to read in-memory.
+- The `jan_2023` folder contains no `signals.jsonl` — check for the file's existence before opening it.

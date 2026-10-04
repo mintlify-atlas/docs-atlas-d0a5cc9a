@@ -1,0 +1,176 @@
+---
+title: "signals.jsonl: LLM-Extracted Signal Schema"
+sidebarTitle: "signals.jsonl"
+description: "Complete field reference for the structured trading signal records in signals.jsonl, including the nested entry object with position, entryRange, targets, stoploss, and reasoning."
+---
+
+Each monthly folder under `content/<mon>_<year>/` may contain an `assets/signals.jsonl` file holding structured trading signals extracted from that month's raw posts. The file is produced by `generate-signals.mjs`, which streams `messages.jsonl`, applies a keyword pre-filter, then calls the `gemma4:31b-cloud` model (via Ollama and the `json-inference` library) once for each surviving (post, ticker) pair. The LLM is given the month's `prompt.mustache` template together with the post text, and is asked to fill the `TradingPositionFormat` JSON schema. The result is appended to `signals.jsonl` immediately, making the script safely resumable if interrupted.
+
+## Format
+
+The file is **JSON Lines** — one self-contained JSON object per line. Each line represents one (post, ticker) verdict. A single post can produce multiple lines if the channel author mentioned more than one ticker in the same message.
+
+<Note>
+  **All verdicts are stored**, including `wait` — the LLM returns `wait` for
+  result reports, market commentary, and posts where no directional trade was
+  found. Consumers **must** filter on `entry.position` and keep only `"long"`
+  or `"short"` records before backtesting.
+</Note>
+
+## Missing-value conventions
+
+Two sentinel values communicate absent optional data:
+
+- **`entryRange` of `{ "from": 0, "to": 0 }`** — the post specified a market
+  entry with no stated price range.
+- **`stoploss: 0`** — the post gave no stop-loss level.
+
+## Top-level fields
+
+<ResponseField name="messageId" type="number" required>
+  The Telegram message ID of the source post. Matches the `id` field in the
+  corresponding `messages.jsonl` record and can be used to look up the
+  original text.
+</ResponseField>
+
+<ResponseField name="symbol" type="string" required>
+  The trading pair in strict `*USDT` format, e.g. `CFXUSDT`. Derived from
+  channel hashtags (`#CFX`, `#CFX/USDT`, or `#CFXUSDT` all normalise to
+  `CFXUSDT`).
+</ResponseField>
+
+<ResponseField name="entry" type="object" required>
+  The structured verdict produced by the LLM. See the expandable section below
+  for all sub-fields.
+
+  <Expandable title="entry fields">
+    <ResponseField name="id" type="number" required>
+      Same value as the top-level `messageId`. Returned by the LLM as part of
+      the schema and kept for self-containedness. The LLM is instructed to
+      return `-1` if it finds no signal, though the keyword pre-filter makes
+      this rare.
+    </ResponseField>
+
+    <ResponseField name="symbol" type="string" required>
+      The trading pair in `*USDT` format. Mirrors the top-level `symbol`.
+    </ResponseField>
+
+    <ResponseField name="position" type="string" required>
+      Signal direction. One of three values:
+
+      | Value | Meaning |
+      |-------|---------|
+      | `"long"` | Bullish trade set-up |
+      | `"short"` | Bearish trade set-up |
+      | `"wait"` | No actionable signal (result post, news, analysis) |
+    </ResponseField>
+
+    <ResponseField name="entryRange" type="object" required>
+      Price range at which the position should be opened. Both sub-fields are
+      numbers.
+
+      - `from` — first (upper) bound of the entry range
+      - `to` — second (lower) bound of the entry range
+
+      Set to `{ "from": 0, "to": 0 }` when the post specifies a market entry
+      with no stated range, or when there is no signal.
+    </ResponseField>
+
+    <ResponseField name="targets" type="number[]" required>
+      Ordered array of take-profit price levels extracted from the post.
+      Typically 3–10 values for a real signal; empty array (`[]`) when
+      `position` is `"wait"`.
+    </ResponseField>
+
+    <ResponseField name="stoploss" type="number" required>
+      Stop-loss price level. `0` when the post gave no stop-loss or when
+      `position` is `"wait"`.
+    </ResponseField>
+
+    <ResponseField name="reasoning" type="string" required>
+      The LLM's plain-English explanation of why it reached this verdict.
+      Intended for prompt debugging and audit; not used by the backtest.
+    </ResponseField>
+
+    <ResponseField name="_context" type="object" required>
+      Metadata injected by `json-inference` after inference completes.
+
+      - `model` — the model name that produced this verdict, e.g.
+        `"gemma4:31b-cloud"`
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="url" type="string" required>
+  Direct Telegram link to the source post, e.g.
+  `https://t.me/WallstreetQueenOfficial/6590`. Useful for manual review of
+  edge cases.
+</ResponseField>
+
+<ResponseField name="message" type="object" required>
+  The source post record, identical to the corresponding `messages.jsonl` line
+  **except that the `photo` field is omitted**. Contains `id`, `content`,
+  `channel`, and `date`.
+</ResponseField>
+
+## Example record
+
+The following is the real CFXUSDT short signal from April 2024:
+
+```json
+{
+  "messageId": 6590,
+  "symbol": "CFXUSDT",
+  "entry": {
+    "id": 6590,
+    "symbol": "CFXUSDT",
+    "position": "short",
+    "entryRange": { "from": 0.468, "to": 0.475 },
+    "targets": [0.455, 0.445, 0.435, 0.425, 0.405, 0.385, 0.368, 0.35],
+    "stoploss": 0.484,
+    "reasoning": "The message provides a clear Short Set-Up for CFX/USDT ...",
+    "_context": { "model": "gemma4:31b-cloud" }
+  },
+  "url": "https://t.me/WallstreetQueenOfficial/6590",
+  "message": {
+    "id": 6590,
+    "content": "...",
+    "channel": "WallstreetQueenOfficial",
+    "date": "2024-04-01T09:52:46.000Z"
+  }
+}
+```
+
+## Consuming the file in Node.js
+
+Filter out `wait` verdicts before building a backtest, and stream line by line
+as with `messages.jsonl`:
+
+```javascript
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+
+const rl = createInterface({
+  input: createReadStream("content/apr_2024/assets/signals.jsonl"),
+  crlfDelay: Infinity,
+});
+
+for await (const line of rl) {
+  if (!line.trim()) continue;
+
+  const record = JSON.parse(line);
+
+  // Skip non-directional verdicts
+  if (record.entry.position === "wait") continue;
+
+  const { symbol, entry, url } = record;
+  console.log(entry.position.toUpperCase(), symbol, entry.entryRange, url);
+}
+```
+
+<Note>
+  **`jan_2023` has no `signals.jsonl`**: every post from that month was
+  rejected by the keyword pre-filter (no post contained both an entry keyword
+  and a levels keyword), so the generator wrote nothing and the file was never
+  created. This is expected and is not a data-loss error.
+</Note>

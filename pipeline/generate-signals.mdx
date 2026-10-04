@@ -1,0 +1,212 @@
+---
+title: "generate-signals.mjs: Run the LLM Extraction"
+sidebarTitle: "generate-signals.mjs"
+description: "Reference for the per-month generate-signals.mjs script: how to run it, what it reads, what it writes, and how to run all 65 months in sequence or in parallel shards."
+---
+
+`generate-signals.mjs` is the core extraction script that lives inside each monthly content folder (e.g. `content/apr_2024/generate-signals.mjs`). It streams the month's raw Telegram posts from `assets/messages.jsonl`, applies a two-stage keyword pre-filter, extracts candidate tickers from hashtags, and calls a local Ollama LLM for every surviving (post, ticker) pair. Each LLM verdict is appended as a JSON line to `assets/signals.jsonl`. The script is fully resumable — already-processed pairs are silently skipped so a run can be interrupted and restarted without duplicating work.
+
+## Running a single month
+
+All file paths inside the script are resolved relative to the script file itself using `import.meta.url`, so the current working directory does not matter. Both invocation forms below are equivalent:
+
+```bash
+# From the repo root:
+node content/apr_2024/generate-signals.mjs
+
+# Or from the month folder:
+cd content/apr_2024
+node generate-signals.mjs
+```
+
+On startup the script prints a summary line showing how many raw posts it found, how many (post, ticker) pairs survived the filter, and how many have already been processed:
+
+```text
+сообщений: 312, пар пост-тикер после фильтра: 178, уже сделано: 134
+```
+
+## Running all months
+
+<CodeGroup>
+
+```bash Linux — all months in sequence
+# All 65 months in chronological order (may_2021 → sep_2026):
+./scripts/linux/generate_test_all.sh
+```
+
+```bash Linux — 10 parallel shards
+# Split into 10 shards that can run concurrently on separate terminals
+# or machines that each have access to the same Ollama endpoint:
+./scripts/linux/generate_test_1.sh    # months  1–7
+./scripts/linux/generate_test_2.sh    # months  8–14
+./scripts/linux/generate_test_3.sh    # months 15–21
+./scripts/linux/generate_test_4.sh    # months 22–28
+./scripts/linux/generate_test_5.sh    # months 29–35
+./scripts/linux/generate_test_6.sh    # months 36–42
+./scripts/linux/generate_test_7.sh    # months 43–49
+./scripts/linux/generate_test_8.sh    # months 50–56
+./scripts/linux/generate_test_9.sh    # months 57–61
+./scripts/linux/generate_test_10.sh   # months 62–65
+```
+
+```bat Windows — all months in sequence
+scripts\win\generate_test_all.bat
+```
+
+```bat Windows — 10 parallel shards
+scripts\win\generate_test_1.bat
+rem ... up to generate_test_10.bat
+```
+
+</CodeGroup>
+
+## Inputs
+
+| File | Description |
+|---|---|
+| `assets/messages.jsonl` | Raw Telegram posts for the month. One JSON object per line. Posts may include a `photo` field (base64 JPEG); the script discards it immediately when reading each line. |
+| `prompt.mustache` | The Mustache extraction prompt tuned to the post format of this specific month. Rendered with `{ symbol }` before being sent to the LLM. See [Prompt Templates](/pipeline/prompt-templates) for details. |
+
+## Outputs
+
+| File | Description |
+|---|---|
+| `assets/signals.jsonl` | LLM verdicts, appended one JSON line per processed (post, ticker) pair. Includes `long`, `short`, and `wait` verdicts. Existing lines are never modified. |
+
+## Console output
+
+Each processed pair is logged in the format `[n/total] id=XXXX SYMBOL -> position`:
+
+```text
+сообщений: 312, пар пост-тикер после фильтра: 178, уже сделано: 0
+[1/178]   id=6580 CHZUSDT -> wait
+[2/178]   id=6583 ADAUSDT -> long
+[3/178]   id=6590 CFXUSDT -> short
+[4/178]   id=6591 BTCUSDT -> wait
+...
+готово: /path/to/content/apr_2024/assets/signals.jsonl
+```
+
+Pairs that are already present in `signals.jsonl` are skipped without printing a line, so the counter may jump if the run is being resumed.
+
+## The TradingPositionFormat schema
+
+This is the exact JSON Schema object passed to `generateObject` that constrains the LLM's output. It is defined inline in each `generate-signals.mjs` and is the authoritative schema for the dataset:
+
+```javascript
+const TradingPositionFormat = {
+  type: "object",
+  required: [
+    "id",
+    "symbol",
+    "position",
+    "entryRange",
+    "targets",
+    "stoploss",
+    "reasoning",
+  ],
+  properties: {
+    id: {
+      type: "number",
+      description: str.newline(
+        "ID сообщения из которого был сформирован сигнал.",
+        "Это число, пиши только его без строкового префикса ID, например, 2134.",
+        "Если сигнала нет, верни -1",
+      ),
+    },
+    symbol: {
+      type: "string",
+      description: str.newline(
+        "Тикер позиции строго в формате *USDT, Например",
+        "Текст Coin: #CELR/USDT преобразуем в CELRUSDT без # и /",
+      ),
+    },
+    position: {
+      type: "string",
+      enum: ["long", "short", "wait"],
+      description: str.newline(
+        "Тип позиции long или short — направление словом:",
+        "Long Set-Up / Short Set-Up.",
+        "Если позиции нет, верни wait",
+      ),
+    },
+    entryRange: {
+      type: "object",
+      description: str.newline(
+        "Диапазон входа, например для 'Entry: 0.29360 - 0.27500$(Buy Partially)'",
+        "верни from=0.29360, to=0.27500; аннотацию в скобках игнорируй.",
+        "Если сигнала нет, верни from=0 и to=0",
+      ),
+      required: ["from", "to"],
+      properties: {
+        from: {
+          type: "number",
+          description: "Первая цена диапазона входа",
+        },
+        to: {
+          type: "number",
+          description: "Вторая цена диапазона входа",
+        },
+      },
+    },
+    targets: {
+      type: "array",
+      description: str.newline(
+        "Цели из поля Targets — уровней бывает от 3 до 10 и больше, числа.",
+        "Аннотации в скобках после цен игнорируй.",
+        "Если сигнала нет, верни []",
+      ),
+      items: { type: "number" },
+    },
+    stoploss: {
+      type: "number",
+      description: str.newline(
+        "СТОП ЛОСС, одна точка; пишется Stoploss / Stop loss / Stop-loss.",
+        "Если сигнала нет, верни 0",
+      ),
+    },
+    reasoning: {
+      type: "string",
+      description: str.newline(
+        "Строковое описание почему ты сделал именно такое решение",
+        "Будет использовано программистом для отладки",
+      ),
+    },
+  },
+};
+```
+
+Key conventions encoded in the schema descriptions:
+
+| Field | "No signal" sentinel |
+|---|---|
+| `id` | `-1` |
+| `position` | `"wait"` |
+| `entryRange` | `{ from: 0, to: 0 }` (market entry with no stated range also uses `0/0`) |
+| `targets` | `[]` |
+| `stoploss` | `0` |
+
+## Resumability
+
+Re-running the script against a partially-complete `signals.jsonl` is always safe. Before the main loop, the script reads any existing output file and builds a `Set` of `messageId_symbol` keys that have already been processed:
+
+```javascript
+const done = new Set();
+if (existsSync(SIGNALS_FILE)) {
+  await eachLine(SIGNALS_FILE, (row) => done.add(`${row.messageId}_${row.symbol}`));
+}
+```
+
+Any pair whose key is already in `done` is skipped without an LLM call. Because `signals.jsonl` is append-only and each line is written atomically by `appendFileSync`, the file is never left in a corrupt state by an interruption.
+
+## Requirements
+
+- **Node.js** (ESM support required; v18+ recommended)
+- **Ollama** running locally and reachable on its default port
+- **`gemma4:31b-cloud`** model pulled and available in Ollama
+- **Git LFS** — run `git lfs pull` after cloning so that `assets/messages.jsonl` files are materialised (the `content/` tree is ~420 MB)
+- **npm dependencies** installed via `npm install` from the repo root
+
+<Warning>
+  If you modify the `prompt.mustache` template or change the `TradingPositionFormat` schema, the `json-inference` library's LLM cache may return stale responses for prompts it has seen before. To force a fresh run, change the cache name passed to `generateObject` (or clear the cache storage) before re-generating signals for any month that was previously processed with the old prompt.
+</Warning>

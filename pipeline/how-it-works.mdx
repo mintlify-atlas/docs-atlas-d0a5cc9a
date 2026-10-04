@@ -1,0 +1,169 @@
+---
+title: "How the Signal Extraction Pipeline Works"
+sidebarTitle: "How It Works"
+description: "End-to-end walkthrough of how raw Telegram posts become structured JSON trading signals: streaming ingestion, keyword filtering, ticker extraction, and LLM prompting."
+---
+
+The signal extraction pipeline transforms raw Telegram posts from the WallstreetQueenOfficial channel into structured JSON trading signals. Each monthly folder contains a `generate-signals.mjs` script that reads the raw `messages.jsonl`, passes candidate posts through a keyword pre-filter, extracts ticker symbols from hashtags, and then calls a local Ollama LLM to fill a strict JSON schema for every (post, ticker) pair. The result is appended line-by-line to `signals.jsonl`. The whole pipeline is resumable: re-running the script after an interruption simply skips pairs that have already been processed.
+
+## Pipeline at a glance
+
+<Steps>
+  <Step title="Stream messages.jsonl line-by-line">
+    Each line is parsed as JSON and the `photo` field (base64 JPEG) is discarded immediately. The file is never loaded whole into memory.
+  </Step>
+  <Step title="Keyword pre-filter">
+    Two regular expressions must both match the post text. Posts that fail either check are dropped before the LLM ever sees them.
+  </Step>
+  <Step title="Ticker extraction">
+    Hashtags in the surviving posts are parsed to produce a list of `*USDT` candidate symbols for that post.
+  </Step>
+  <Step title="LLM prompting (per ticker)">
+    For each (post, ticker) pair, the Mustache prompt template is rendered and sent alongside the post content to `gemma4:31b-cloud` via Ollama. The LLM returns a structured `TradingPositionFormat` object.
+  </Step>
+  <Step title="Append to signals.jsonl">
+    Every verdict — `long`, `short`, or `wait` — is appended as a JSON line to `assets/signals.jsonl`.
+  </Step>
+</Steps>
+
+## Streaming ingestion
+
+The raw post files embed attached channel images as base64-encoded JPEGs inside each JSON record. A single month's `messages.jsonl` can therefore be several hundred megabytes. Loading the entire file into memory at once is explicitly prohibited — instead the script streams the file line-by-line using Node's `readline` interface:
+
+```javascript
+// jsonl читаем ТОЛЬКО построчно стримом: в messages.jsonl лежат base64-фото,
+// целиком файл в память не поднимаем никогда
+const eachLine = async (file, onRow) => {
+  const rl = createInterface({ input: createReadStream(file), crlfDelay: Infinity });
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    onRow(JSON.parse(line));
+  }
+};
+```
+
+The `photo` field is stripped immediately when each row is destructured — it never travels further into the pipeline:
+
+```javascript
+const { photo, ...msg } = row;
+```
+
+This pattern is used for both `messages.jsonl` (to read posts) and `signals.jsonl` (to rebuild the resumability set) so that neither file blows the process heap.
+
+## Keyword pre-filter
+
+Not every post in the channel is a trading signal. Result announcements, market commentary, news, and promotional posts all appear in the raw feed. Two regular expressions gate the LLM call — **both** must match the post's text or the post is discarded:
+
+```javascript
+// Entry signal keywords
+const ENTRY_RE = /entry|buy zone|buy:|buy a bag|just buy|buying setup|market price|longing|shorting/i;
+
+// Price levels keywords
+const LEVELS_RE = /target|take.?profit|stop/i;
+```
+
+`ENTRY_RE` catches the vocabulary the channel author uses to announce a new position. `LEVELS_RE` confirms that at least one concrete price level (a target, a take-profit level, or a stop-loss) is mentioned alongside it. A post must satisfy both to be forwarded to the LLM. This early, cheap filter eliminates the large majority of posts and keeps LLM API calls to the genuinely ambiguous minority.
+
+## Ticker extraction
+
+Signal posts identify the traded asset with a hashtag in one of several formats:
+
+| Raw hashtag | Normalised to |
+|---|---|
+| `#ADA` | `ADAUSDT` |
+| `#ADA/USDT` | `ADAUSDT` |
+| `#ADAUSDT` | `ADAUSDT` |
+
+The `candidates()` function handles all three forms with a single regex pass:
+
+```javascript
+// Кандидаты-тикеры из тегов поста: #ADA, #ADA/USDT, #ADAUSDT -> ADAUSDT
+const candidates = (content) => {
+  const out = new Set();
+  for (const m of content.matchAll(/#([A-Z0-9]{2,12})(?:\/USDT|USDT)?\b/g)) {
+    let base = m[1];
+    if (base.endsWith("USDT")) base = base.slice(0, -4);
+    if (base.length >= 2 && /[A-Z]/.test(base)) out.add(base + "USDT");
+  }
+  return [...out];
+};
+```
+
+Each returned symbol becomes its own LLM call paired with the same post, since a single post occasionally mentions more than one ticker.
+
+## LLM prompting
+
+For each (post, ticker) pair that passes both the keyword filter and the deduplication check, the script calls `generateObject` from the `json-inference` library:
+
+```javascript
+const entry = await generateObject(
+  InferenceName.OllamaInference,
+  {
+    format: TradingPositionFormat,
+    messages: [
+      { role: "user", content: Mustache.render(PROMPT_TEMPLATE, { symbol }) },
+      {
+        role: "user",
+        content: str.newline(
+          `ID ${msg.id}`,
+          "",
+          msg.content,
+          "",
+          `[${new Date(msg.date).toISOString()}]: ${url}`,
+        ),
+      },
+    ],
+  },
+  "gemma4:31b-cloud",
+);
+```
+
+- **Inference backend:** `InferenceName.OllamaInference` — a locally-running Ollama instance.
+- **Model:** `gemma4:31b-cloud`.
+- **Prompt:** The `prompt.mustache` template for that month, rendered with the current `{ symbol }` variable, is sent as the first user message. The raw post text (plus its ID, date, and channel URL) follows as a second user message.
+- **Schema:** `TradingPositionFormat` — a JSON Schema object passed to `generateObject` that constrains the LLM's output to the required fields (`position`, `entryRange`, `targets`, `stoploss`, `reasoning`, and so on). The full schema is documented on the [generate-signals.mjs reference page](/pipeline/generate-signals).
+
+## Resumability
+
+Before processing any posts, the script reads any existing `signals.jsonl` and builds a `Set` of already-processed `messageId_symbol` keys:
+
+```javascript
+const done = new Set();
+if (existsSync(SIGNALS_FILE)) {
+  await eachLine(SIGNALS_FILE, (row) => done.add(`${row.messageId}_${row.symbol}`));
+}
+```
+
+At the start of each loop iteration the key for the current pair is checked:
+
+```javascript
+const key = `${msg.id}_${symbol}`;
+if (done.has(key)) {
+  continue;
+}
+```
+
+Interrupting the script mid-run (network timeout, Ctrl-C, system restart) loses at most the single in-flight LLM call. All previously written lines remain intact and the next run picks up exactly where the previous one left off.
+
+## Output
+
+Every verdict the LLM returns is appended unconditionally to `signals.jsonl`:
+
+```javascript
+appendFileSync(
+  SIGNALS_FILE,
+  JSON.stringify({ messageId: msg.id, symbol, entry, url, message: msg }) + "\n",
+);
+```
+
+Progress is logged to the console in the format `[n/total] id=XXXX SYMBOL -> position`, for example:
+
+```text
+[42/178] id=6590 CFXUSDT -> short
+[43/178] id=6591 BTCUSDT -> wait
+[44/178] id=6594 ADAUSDT -> long
+```
+
+<Note>
+  `wait` verdicts are stored deliberately. They let you audit prompt quality after the fact: if a result announcement (`Target 1 done ✅`) or a pure chart commentary post is incorrectly tagged as `long` or `short`, the stored record makes that visible. Downstream consumers are expected to filter on `entry.position !== "wait"`.
+</Note>

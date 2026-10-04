@@ -1,0 +1,125 @@
+---
+title: "fetch_messages.mjs: Scrape the Telegram Channel"
+sidebarTitle: "fetch_messages.mjs"
+description: "Scrape the WallstreetQueenOfficial Telegram channel day-by-day into per-month messages.jsonl files using telegram-reader. Requires a valid Telegram session."
+---
+
+`fetch_messages.mjs` is the data acquisition layer for the entire dataset. It walks through every calendar day in the configured date range, pulls that day's posts from the `WallstreetQueenOfficial` Telegram channel via `telegram-reader`, and writes them into per-month `messages.jsonl` files under `content/`. Everything downstream — signal extraction, backtesting, validation — ultimately depends on the files this script produces.
+
+## Purpose
+
+The script iterates day by day from **7 May 2021** (`START`) to **30 September 2026** (`END`) — the full span of the dataset — and populates one `messages.jsonl` file per calendar month. Each run is a full re-scrape of the range; there is no incremental mode.
+
+## Prerequisites
+
+Before running this script you need:
+
+1. **A valid Telegram API session in `session.txt`.** The `telegram-reader` package uses MTProto under the hood and requires an active session file in the project root. See [Session setup](#session-setup) below.
+2. **Node.js dependencies installed.** `telegram-reader` is listed in `package.json` and is installed with the standard `npm install`.
+
+<Note>
+  `telegram-reader` keeps the Node.js event loop open after all async work
+  finishes (the MTProto client holds open network connections). The script calls
+  `process.exit(0)` explicitly at the very end to force a clean shutdown.
+</Note>
+
+## What it does
+
+The script's core loop is straightforward:
+
+```javascript
+const START = Date.UTC(2021, 4, 7);   // 7 May 2021 — first channel post (id=9)
+const END   = Date.UTC(2026, 8, 30);  // 30 September 2026
+
+for (let ts = START; ts <= END; ts += 86_400_000) {
+  const when = new Date(ts + 12 * 3_600_000); // noon UTC — safely inside the calendar day
+  const messages = await scrapeDay({ channel: "WallstreetQueenOfficial", when });
+  // ...write to messages.jsonl...
+}
+process.exit(0); // MTProto client holds the event loop open
+```
+
+Step by step:
+
+1. **Day iteration.** The outer loop advances one day at a time (86,400,000 ms). Each iteration constructs a `when` timestamp at noon UTC — this keeps the request safely inside the target calendar day regardless of timezone handling inside `telegram-reader`.
+
+2. **Channel scrape.** `scrapeDay({ channel: "WallstreetQueenOfficial", when })` fetches all posts published on that calendar day and returns an array of message objects.
+
+3. **Monthly file grouping.** Posts are grouped by `<mon>_<year>` key (e.g. `apr_2024`). When the key changes, the current write stream is closed and a new one is opened:
+
+   ```javascript
+   const dir = join("content", key, "assets");
+   mkdirSync(dir, { recursive: true });
+   out = createWriteStream(join(dir, "messages.jsonl"));
+   ```
+
+   Output directories are created automatically with `{ recursive: true }` — no manual folder setup needed.
+
+4. **Progress logging.** After each day the script prints a timestamped summary to stdout:
+
+   ```
+   [2025-01-15T10:23:41.002Z] 2024-04-03: +4 (total 4821)
+   ```
+
+   The format is `[ISO timestamp] YYYY-MM-DD: +N (total T)` where `+N` is the number of posts scraped that day and `T` is the running total.
+
+5. **Termination.** After the last day the final write stream is closed, a `готово: N постов` summary is printed, and `process.exit(0)` is called.
+
+## Running the script
+
+```bash
+node scripts/fetch_messages.mjs
+```
+
+Run from the project root. The script has no CLI flags — the date range and channel name are hardcoded constants at the top of the file.
+
+## Output structure
+
+Posts are written as JSON Lines to:
+
+```text
+content/<mon>_<year>/assets/messages.jsonl
+```
+
+For example, all posts from April 2024 land in `content/apr_2024/assets/messages.jsonl`. Each line is a raw Telegram post object with the following fields:
+
+| Field | Description |
+|---|---|
+| `id` | Telegram message ID (integer) |
+| `content` | Post text |
+| `channel` | Channel name (`WallstreetQueenOfficial`) |
+| `date` | Publication time, ISO 8601 UTC |
+| `photo` | Attached image as a base64-encoded JPEG string, when present |
+
+<Warning>
+  Posts that include a photo embed the full base64 JPEG inline in the JSON
+  object. This makes individual lines — and the entire `messages.jsonl` files —
+  very large. **Always stream these files line by line** (e.g. with a readline
+  interface or a line-by-line iterator). Never load a whole `messages.jsonl`
+  into memory with `readFileSync`.
+</Warning>
+
+## Session setup
+
+The script depends on `telegram-reader` finding a valid MTProto session in `session.txt` at the project root. To create the session file:
+
+1. Obtain Telegram API credentials (`api_id` and `api_hash`) from [my.telegram.org](https://my.telegram.org).
+2. Follow the `telegram-reader` package documentation to authenticate and save the session.
+
+The session file stores the encrypted MTProto session string. It must be present and valid before the script is run. If the session is missing or expired, `telegram-reader` will throw an authentication error before any posts are fetched.
+
+<Warning>
+  This script **creates or overwrites** all `messages.jsonl` files under
+  `content/` for the configured date range. Run it only when you need to extend
+  the dataset to a new date range or re-scrape an existing period. Do not run it
+  casually — it issues thousands of API calls and takes a long time to complete
+  the full range.
+</Warning>
+
+<Note>
+  The dataset already ships with `messages.jsonl` files covering the full range
+  from **7 May 2021 to 30 September 2026** (stored in Git LFS). You only need
+  to run this script if you want to extend the range beyond September 2026, or
+  if you need to re-scrape a period where the existing files are incomplete or
+  corrupted.
+</Note>

@@ -1,0 +1,193 @@
+---
+title: "Exit Calibration: Fitting Thresholds to PnL Trajectories"
+sidebarTitle: "Exit Calibration"
+description: "How exit thresholds—hard stop, PnL floor, profit lock, and trailing take—are calibrated against the population of 24-hour PnL trajectories using tangent replay and bisection."
+---
+
+The calibration philosophy is deliberate and narrow: take only direction and the moment of entry from the signal author, then replace everything else — targets, stop-loss, leverage sizing — with exits that are calibrated on how the channel's signals *actually* behaved. A published post is static and local; it is a set of numbers written before the market responded. The exits used in production are age-dependent functions estimated over the full ensemble of all signals from the channel. The author's skill at picking direction is measured and used; the author's risk-management is discarded and rebuilt from data.
+
+## The Trajectory Model
+
+Every signal opens a position that runs untouched for 24 hours. The backtesting engine records one snapshot per minute: the current net PnL, the running maximum (MFE, maximum favourable excursion), and the running minimum (MAE, maximum adverse excursion). All values are net percentages in the same coordinate system used by the engine's `data.pnl.pnlPercentage` field and by every threshold in the calibration.
+
+Costs are front-loaded at **0.4 pp** on the first tick, so `pnl ≈ −0.4%` at the open. This budget breaks down as:
+
+| Component | Amount |
+|---|---|
+| Round-trip commission | ~0.2 pp |
+| Funding / borrowing (T ≤ 18 h, includes short) | 0–0.075 pp |
+| Reserve buffer (floats against actual carry) | 0.125–0.2 pp |
+
+Front-loading removes the linear time drift from PnL, making thresholds stable and worst-case conservative.
+
+The working horizon **T** is an offline compiler parameter (range: T ≤ 1080 minutes, hard limit T < 1440). The collector always writes the full 24-hour trajectory; T is applied offline. All labelling, baselines, and replay are on the same T and the same leverage λ.
+
+## Winner Labelling
+
+A trajectory is a **winner** if its liquidation-capped outcome at minute T−1 is positive:
+
+```text
+winner = baseline_outcome(T−1) > 0
+```
+
+where the baseline is **"hold to T with isolation-margin liquidation at working leverage λ"** — not "hold to T" in a vacuum. The engine has no exchange stop, but isolation-margin liquidation is always present. A trajectory that touches the liquidation level `L_liq(λ)` is closed at `L_liq` in the baseline; otherwise the baseline outcome is `pnl[T−1]`.
+
+<Note>
+The baseline **must** include liquidation. Without it the baseline is a physically impossible counterfactual that attributes the benefit of cutting catastrophic tail losses to the exit mechanisms, even though the exchange would have cut those losses anyway. In the toy dataset (λ=10, `L_liq = −10.4`), omitting liquidation inflates the baseline delta by exactly +40 pp — the depth of the catastrophe trajectory below the liquidation level.
+</Note>
+
+## The Four Calibrated Exit Mechanisms
+
+Exit mechanisms are checked inside every minute tick in a fixed priority order: liquidation (exchange, structural) → floor → lock → trailing → time exit. After any mechanism closes a position, subsequent mechanisms in the same minute are not called.
+
+| Mechanism | Territory | Role |
+|---|---|---|
+| Isolation-margin liquidation | `pnl ≤ L_liq(λ)` | Structural cap; exchange action, not a listener |
+| Hard stop | `floor(0)` anchor | Anchor for the floor curve; no separate production mechanism |
+| PnL floor `floor(t)` | `pnl < 0` | Cut losers early; anti-limbo for stagnating positions |
+| Profit lock `lock(t)` | `pnl > 0`, peak below `lock(T−1)` | Free capital from statistically dead weak winners |
+| Trailing take | `peak ≥ arm` | Capture large moves ("runners") |
+| Time exit at T | Everything remaining | Terminal exit; guaranteed by the framework |
+
+### Hard Stop (Anchor)
+
+The hard stop is **not a separate production mechanism**. In the strategy file it lives only as `floor(0)` — the deepest value in the floor grid — and carries no separate attribution. Catastrophic losses in production are closed by the floor (labelled `pnl_floor`) or, if the process lags, by exchange liquidation.
+
+**Calibration procedure:**
+
+<Steps>
+  <Step title="Initialise from winners' final MAE">
+    Compute the q95–q99 of the final MAE depths of winners. This gives the starting candidate depth, e.g. `hardStop₀ = −1.6` at q95 with n=5 winners.
+  </Step>
+  <Step title="Step-deepen until zero observed kills">
+    From the initialisation, deepen by 0.25 pp steps (a fixed procedure constant). At each step, run the tangent replay on the winner population. Stop at the first step with zero observed winner kills.
+  </Step>
+  <Step title="Publish the rule-of-three bound">
+    Zero observations do not prove the kill rate is near zero. By the rule of three, 0 kills from n winners gives a 95% upper bound of 3/n. At n=187 that bound is **1.6%**; the passbook records this bound, not a point zero.
+  </Step>
+</Steps>
+
+The hard stop is always **global** — tail statistics require the full population and cannot be estimated from a regime sub-pool of 25–40 winners.
+
+**Compiler check:** the liquidation price at working leverage λ must lie deeper than `hardStop` by at least the q95 of the observed VWAP lag (|raw price − VWAP(5m)|). Without this margin, in a fast cascade the exchange liquidates before the calibrated floor can fire.
+
+### PnL Floor `floor(t) = a − b·e^(−t/τ)`
+
+The floor is the main money mechanism of the stack. It cuts losers earlier and shallower than liquidation or time-exit would, and prevents a losing position from sitting in a shrinking allowance indefinitely.
+
+**Shape:** monotonically rising from `floor(0) = hardStop` toward the asymptote `a`. The invariant `a < 0` is enforced by the compiler — the floor's territory is `pnl < 0`, and if `a` were to go positive the floor would encroach on the lock's territory and break the definition of the lower coverage hole.
+
+**Parameter fates:**
+
+| Parameter | How it is determined |
+|---|---|
+| `b` | Bound by the anchor: `b = a − hardStop` |
+| `τ` | Frozen by shape fit — first minute where the depth of the empirical q05 MAE(t) of winners passes 63.2% (= 1 − 1/e) of its range from start to finish; linear interpolation between ticks |
+| `a` | Sole replay knob — full bisection to `sup{a : upperCI(path harm) ≤ target}` |
+
+The shape-fit logic for τ:
+
+```text
+d₀ = q05 MAE depth at minute 0
+d_T = q05 MAE depth at minute T−1
+target = d₀ + (1 − e⁻¹) · (d_T − d₀)
+τ = first minute where q05 MAE depth ≥ target  (linear interpolation)
+```
+
+<Note>
+The per-minute quantile of a running minimum cannot rise — `mae_i(t)` is non-increasing for every trajectory, so the pointwise quantile of a family of non-increasing functions is itself non-increasing. A "rising floor" can only be achieved through a parametric family whose shape is given by construction, not by fitting a quantile directly to the data.
+</Note>
+
+**Regime variants** are permitted for the floor: it relies on central-distribution statistics where regime sub-pool sizes are workable. The admission procedure is described in [Regime Calibration](/architecture/regime-calibration).
+
+### Profit Lock `lock(t) = c·(1 − e^(−(t − t_arm)/κ))`
+
+The profit lock is a **killer of lagging winners, not a ratchet**. It closes a position in profit whose best observed peak is below the pace of genuine winners, freeing capital. It does *not* collect profit before it evaporates — a position whose peak exceeds `lock(T−1)` (the ceiling of the curve inside the horizon) is invisible to the lock, and a position whose peak is below that ceiling is closed at the *current* PnL, not at the peak.
+
+**Grace period G — structural requirement:**
+
+Any winner that recovers from a negative start crosses zero with a running peak of approximately zero — by construction below any positive `lock(t)`. Without a grace period, such winners would be killed on their very first positive minute. "Early dip then recovery" trajectories are a significant share of signal-channel winners; a lock without grace predictably fails the harm-calibration gate.
+
+The actual court begins at `max(t_cross + 1, t_cross + G)`, where `t_cross` is the first whole minute with `pnl > 0`. The crossing minute itself is never judged — it only records `t_cross`.
+
+**Parameter fates:**
+
+| Parameter | How it is determined |
+|---|---|
+| `t_arm` | KS rule on the **full** population MFE(t) — k consecutive control minutes above the critical value (see [Backtesting Strategy](/architecture/backtesting-strategy)) |
+| `κ` | Frozen by shape fit on winners surviving the floor: first minute (from arming) where the empirical q25 MFE(t) reaches 63.2% of its final level at T−1; base is zero (the family is hard-anchored at `lock(t_arm) = 0`) |
+| `G` | Frozen by the catch-up distribution: winners surviving the floor with `t_cross ≥ t_arm` only (early crossers have degenerate zero catch-up and would collapse q75 to G=0). G = q75 of `(first minute mfe reaches q25 curve) − t_cross` over that subset |
+| `c` | Sole replay knob — full bisection to `sup{c : upperCI(path harm) ≤ target}` |
+
+**Intentional upper coverage hole:** the lock curve rises asymptotically toward `c` but only reaches `lock(T−1) < c` inside the horizon. Peaks in the band `(lock(T−1), arm)` are invisible to both the lock and the trailing take (if `arm = null`, the hole is `(lock(T−1), ∞)`). Only time-exit covers this band. This is the accepted cost of choosing a killer over a ratchet.
+
+**Delta admission criterion:** because a mechanism with a true delta of zero would never have a CI lower bound above zero, the lock uses a *point* delta criterion (point delta ≥ 0), explicitly noted in the passbook as: *"delta is point estimate only; mechanism admitted as a non-loss capital releaser; monetary value possibly zero."*
+
+### Trailing Take
+
+The trailing take captures large moves — "runners" — preventing a position that peaked at +12% from collapsing to a flat result.
+
+**Calibration:**
+
+<Steps>
+  <Step title="Identify runners">
+    From winners surviving the floor and lock: runners are trajectories whose final MFE ≥ q90 of all final MFE values.
+  </Step>
+  <Step title="Set the arm">
+    `arm` = midpoint of the gap between the minimum peak of runners and the maximum peak of non-runners. If no runners or no gap exists, the mechanism is disabled (`arm = null`).
+  </Step>
+  <Step title="Set the retrace">
+    `retrace` = maximum survived drawdown of runners × 1.25 (a fixed procedure constant).
+  </Step>
+  <Step title="CI disable rule">
+    If runners are absent in ≥25% of block resamples, or the CI of `retrace` is wider than `retrace` itself, publish `TRAILING_ARM = null` and record the fact in the passbook.
+  </Step>
+</Steps>
+
+**Compiler invariant:** `arm > lock(T−1)`. This guarantees the territories do not overlap: the lock sees peaks below its own ceiling; trailing arms above `arm`. If `arm ≤ lock(T−1)`, the lock would intercept armed positions and attribution breaks down. The compiler checks the stronger sufficient form `arm > c`.
+
+The trailing take is always **global** and carries no harm target. Its actual harm (runners closed below their baseline) is measured by replay and published as a separate line in the stack report.
+
+## Tangent Replay
+
+Tangent replay simulates the position minute by minute and closes it at the first touch of a threshold curve — exactly as the listener will close it in production. The same instrument serves two purposes:
+
+- **Calibration inner loop:** given a candidate parameter value, replay the full ensemble and measure the path harm (share of winners killed below their baseline outcome).
+- **Validation outer loop:** replay on held-out months to test full pipeline stability.
+
+A position that dips below the curve and recovers is already closed at the dip in the replay — the semantics of "touch = close" are preserved by construction.
+
+## Calibration Bootstrap (Without Refit)
+
+The calibration bootstrap answers: *"how dangerous is this particular curve?"* — not *"how stable is the full pipeline?"*
+
+- Resample monthly blocks (not individual trajectories — within-month correlation would narrow the CI artificially).
+- Replay each pseudo-sample with the **same fixed candidate parameter** — no refitting.
+- Compute the upper bound of the CI of the path harm.
+- Bisect to `sup{param : upperCI(harm) ≤ target}`.
+
+**Common random numbers (CRN) are required:** all candidate values in one bisection loop are evaluated on the same fixed set of resamples (seeds drawn once per loop). Without CRN, independent noise breaks the monotonicity of `upperCI` and bisection converges to the wrong value.
+
+## Validation Bootstrap (With Refit)
+
+The validation bootstrap answers a different question: *"how stable is the entire calibration pipeline?"*
+
+- Resample monthly blocks.
+- **Refit on each pseudo-sample** (full pipeline: hard stop → floor → lock → trailing).
+- Replay the refit curves on the same pseudo-sample.
+- Admission gate: CI of delta versus the liquidation baseline does not include zero (except for the lock, which uses the point-delta criterion).
+
+The two bootstraps are separate objects — confusing them is a common source of circular reasoning.
+
+## Mechanism Reference
+
+| Mechanism | Formula | Shape parameter | Replay knob | Harm target |
+|---|---|---|---|---|
+| Hard stop | `floor(0)` (anchor) | — | Step-deepen to 0 kills | Rule of three: 3/n |
+| PnL floor | `a − b·e^(−t/τ)` | τ from q05 MAE 63.2% rule | `a` via bisection | upperCI ≤ ~5% |
+| Profit lock | `c·(1 − e^(−(t−t_arm)/κ))` | κ from q25 MFE 63.2% rule; G from q75 catch-up | `c` via bisection | upperCI ≤ ~5% |
+| Trailing take | arm + retrace | Gap between runner/non-runner peaks | Structure only | Measured, not targeted |
+
+<Note>
+All thresholds at every stage are in **net PnL percentage** — the same coordinate system as `data.pnl` in the dump and `data.pnl.pnlPercentage` inside `listenActivePing`. Nothing is ever converted from prices. The calibration and execution live in one coordinate system by construction.
+</Note>

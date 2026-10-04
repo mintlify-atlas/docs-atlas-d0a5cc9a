@@ -1,0 +1,171 @@
+---
+title: "Mustache Prompt Templates: Adapting to Post Format Changes"
+sidebarTitle: "Prompt Templates"
+description: "Each monthly folder carries its own prompt.mustache that encodes the post format rules for that period, with few-shot examples of signals, results posts, and non-signal messages."
+---
+
+Every monthly folder in `content/` contains its own `prompt.mustache` file. This is intentional: the WallstreetQueenOfficial channel's post format changed meaningfully several times over the dataset's five-year span (May 2021 – September 2026). Field names shifted (`Stoploss` → `Stop loss` → `Stop-loss`), header layouts evolved, and the vocabulary used for entry keywords drifted. Rather than trying to write a single universal prompt, each month carries a prompt that is precisely calibrated to the post format of that period, with few-shot examples drawn from actual posts of that time.
+
+## Template structure
+
+A `prompt.mustache` file contains the following elements, in order:
+
+1. **Role and task description** — a short paragraph explaining to the LLM what it is doing: auditing a professional trader's channel and converting text recommendations into JSON.
+
+2. **The `{{symbol}}` variable** — the only Mustache interpolation in the template. It tells the LLM which ticker to extract a position for from the post. This is rendered at runtime via `Mustache.render(template, { symbol })` before the prompt is sent.
+
+3. **Positive few-shot examples** — one or two real signal posts from that month, showing both a Long Set-Up and a Short Set-Up in the exact format the channel was using at that time.
+
+4. **Negative few-shot examples** — posts that look superficially like signals (they mention targets and a ticker) but should return `wait`. The most important negative category is result announcements — posts that say "Target 1 done ✅" or "120% Profits booked" — because they share vocabulary with real signals and can easily confuse an LLM that has no period-specific guidance.
+
+5. **Period-specific format rules** — explicit bullet-point rules covering the quirks of this month's post format: how the header line is structured, which slash/hashtag variant is used for the ticker, how to handle parenthetical annotations like `(Buy partially)` or `(Short-mid term)`, and which spelling of stop-loss is in use.
+
+## The apr_2024 prompt
+
+The full `content/apr_2024/prompt.mustache`, shown exactly as it is stored:
+
+```text
+# Руководство
+
+Я провожу аудит торговых рекомендаций профессионального трейдера.
+Мне нужно преобразовать его рекомендацию из текстового формата в JSON структуру.
+
+Возвращай только позиции для тикера `{{symbol}}`
+
+Из предоставленных сообщений найди его входы в позицию, например
+
+```
+Coin: #CHZ/USDT
+
+Long Set-Up 
+
+Leverage: 5-10x
+
+#CHZ already breaked out the symmetrical traingle and looking Bullish.
+
+Entry: 0.1510 - 0.1440$(Buy partially)
+
+Targets: 0.1550 - 0.1590 - 0.1630 - 0.1670 - 0.1760 - 0.1840 - 0.1940 - 0.2020 - 0.2100$(Short-mid term)
+
+Stop-loss: 0.1380$
+```
+
+Бывают и шорты, например
+
+```
+Coin: #CFX/USDT
+
+Short Set-Up 
+
+Leverage: 5-10x
+
+#CFX already breaked out the Symmetrical Triangle and looking bearish.
+
+Entry: 0.468 - 0.475$(Enter partially)
+
+Targets: 0.455 - 0.445 - 0.435 - 0.425 - 0.405 - 0.385 - 0.368 - 0.350$(Short term)
+
+Stop-loss: 0.484$
+```
+
+Правила формата этого периода:
+
+- шапка поста: `Coin: #CELR/USDT` — тег со слэшем, преобразуй в CELRUSDT без # и /;
+- направление — словом: Long Set-Up / Short Set-Up;
+- поле Leverage игнорируй;
+- текстовые аннотации в скобках после цен — (Enter Partially), (Buy partially), (Short - mid term) — игнорируй, это не числа;
+- стоп пишется Stoploss / Stop loss / Stop-loss — читай любой вариант.
+
+Верни именно входы, публикации о результате работ фильтруй.
+
+```
+COIN NAME: #CFX/USDT
+
+SHORT SET-UP
+
+Four Targets done nicely within few hours😵
+
+Target 1: 0.455$✅
+Target 2: 0.445$✅
+Target 3: 0.435$✅
+Target 4: 0.425$✅
+
+120% Profits booked with 10x Lev🤑
+
+Four Targets destroyed perfectly within few hours🔥
+
+Whether the market goes up or down, our VIP members book profits in every direction. So don't miss your Profits and Join our premium and making continuous profits💯. Message me now @wallstreetqueenadmin
+
+Cheers to all VIP members🍾🍾
+
+VIP ONLY (WALLSTREET QUEEN OFFICIAL)
+```
+
+Аналитику, новости и чартовые обзоры без входа в позицию тоже фильтруй (wait).
+
+Шаблоны произвольные, общий вид такой
+```
+
+## Rendering
+
+At runtime, `Mustache.render` replaces `{{symbol}}` with the ticker extracted from the post's hashtag before the prompt is sent to the LLM:
+
+```javascript
+{ role: "user", content: Mustache.render(PROMPT_TEMPLATE, { symbol }) }
+```
+
+`symbol` is the only dynamic variable — for example `CFXUSDT` or `ADAUSDT`. Everything else in the template (the examples, the rules, the task description) is static for the whole month.
+
+## Adapting prompts for new periods
+
+When the channel author changes their post format — new header layout, different field names, new annotation styles — the existing prompt will start producing incorrect verdicts. The workflow for adapting is:
+
+<Steps>
+  <Step title="Inspect recent posts">
+    Run `scripts/read_posts.mjs` to print the latest posts from the channel and study the new format firsthand:
+
+    ```bash
+    node scripts/read_posts.mjs
+    ```
+  </Step>
+  <Step title="Identify format changes">
+    Compare the new posts against the current prompt's examples and rules. Common changes to look for:
+    - Header line structure (`Coin:` vs `COIN NAME:` vs no header)
+    - Direction keyword casing (`Long Set-Up` vs `LONG SET-UP`)
+    - Stop-loss field name (`Stoploss` / `Stop loss` / `Stop-loss`)
+    - Entry field name (`Entry:` vs `Buy Zone:`)
+    - Presence or absence of a `Leverage:` line
+    - New parenthetical annotations after prices
+  </Step>
+  <Step title="Create a new prompt.mustache">
+    Copy the previous month's `prompt.mustache` into the new month's folder and update it:
+    - Replace the few-shot examples with real posts from the new period (at least one long, one short)
+    - Add a negative example drawn from a result announcement in the new format
+    - Update the format rules bullet list to reflect the changes you identified
+    - Keep `{{symbol}}` as the only Mustache variable
+  </Step>
+  <Step title="Validate the new prompt">
+    Run `scripts/validate_prompt.mjs` against a handful of known posts — one real signal, one result announcement, one pure analysis post:
+
+    ```bash
+    node scripts/validate_prompt.mjs
+    ```
+
+    Check that the output matches expectations before running the full month's extraction.
+  </Step>
+</Steps>
+
+## Quality signals for a good prompt
+
+A well-tuned prompt reliably produces the following behaviour:
+
+- **Result announcements** (`Target 1 done ✅`, `120% Profits booked`) → `wait`. These posts look structurally similar to signals but are reports of past performance.
+- **Pure analysis and chart commentary** (posts with no `Entry:` line, only price levels and opinions) → `wait`.
+- **Long Set-Up posts** → `long` with correct `entryRange`, `targets`, and `stoploss` values.
+- **Short Set-Up posts** → `short` with correct `entryRange`, `targets`, and `stoploss` values.
+- **Parenthetical annotations** like `(Buy partially)` or `(Short-mid term)` → ignored; only the numeric prices are extracted.
+- **Missing stop-loss** → `stoploss: 0` (not an error; some posts genuinely omit it).
+
+<Tip>
+  Before writing new few-shot examples, run `scripts/check_filter.mjs` to see which posts from the period pass the keyword pre-filter but are not actual signals. These are precisely the posts that are most likely to confuse the LLM — result announcements and analysis posts that happen to mention "target" or "stop" — and they are the best candidates to add as negative examples in your updated `prompt.mustache`.
+</Tip>

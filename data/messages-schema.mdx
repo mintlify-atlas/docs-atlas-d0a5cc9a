@@ -1,0 +1,102 @@
+---
+title: "messages.jsonl: Raw Telegram Post Schema"
+sidebarTitle: "messages.jsonl"
+description: "Field-by-field reference for the raw Telegram post records stored in each month's assets/messages.jsonl. Covers id, content, channel, date, and photo fields."
+---
+
+Each monthly folder under `content/<mon>_<year>/` contains an `assets/messages.jsonl` file that holds every raw post scraped from the `WallstreetQueenOfficial` Telegram channel during that month. These files are the primary source of truth for the dataset: they are written once by `scripts/fetch_messages.mjs` and then consumed by `generate-signals.mjs` to produce the structured signal records. The files are stored in Git LFS — run `git lfs pull` after cloning before attempting to read them.
+
+## Format
+
+The file is **JSON Lines** — one self-contained JSON object per line, with no trailing comma and no surrounding array. Each line represents a single channel post.
+
+<Warning>
+  Photo fields contain full base64-encoded JPEG data. A single image can be
+  several hundred kilobytes when encoded, and a month's file can exceed 50 MB.
+  **Never load the whole file into memory.** Always open the file as a stream
+  and process it one line at a time.
+</Warning>
+
+## Fields
+
+<ResponseField name="id" type="number" required>
+  The Telegram message ID, unique within the channel. Used as the join key
+  between `messages.jsonl` and `signals.jsonl`.
+</ResponseField>
+
+<ResponseField name="content" type="string" required>
+  The plain-text body of the post exactly as scraped. May include hashtags,
+  emoji, price levels, and multi-line formatting used by the channel author.
+</ResponseField>
+
+<ResponseField name="channel" type="string" required>
+  The channel username the post was scraped from, e.g. `WallstreetQueenOfficial`.
+  Present on every record so that files can be merged across channels without
+  losing provenance.
+</ResponseField>
+
+<ResponseField name="date" type="string" required>
+  Publication timestamp in ISO 8601 UTC, e.g. `2024-04-01T09:52:46.000Z`.
+  Milliseconds are always present (`.000Z` when the Telegram API returns
+  second-level precision).
+</ResponseField>
+
+<ResponseField name="photo" type="string | undefined">
+  The attached image, base64-encoded as a JPEG string. Present only when the
+  post had a photo; omitted entirely — not set to `null` — when there is no
+  image. Strip or ignore this field before passing the record downstream.
+</ResponseField>
+
+## Example record
+
+The following shows a minimal signal post. The `photo` field is replaced with a
+placeholder to keep the example readable — real values are long base64 strings.
+
+```json
+{
+  "id": 6590,
+  "content": "Short Set-Up\n\nCoin: #CFX/USDT\n\nEntry: 0.468 - 0.475$\n\nTargets: 0.455 / 0.445 / 0.435 / 0.425 / 0.405 / 0.385 / 0.368 / 0.35\n\nStoploss: 0.484$",
+  "channel": "WallstreetQueenOfficial",
+  "date": "2024-04-01T09:52:46.000Z",
+  "photo": "<base64 JPEG>"
+}
+```
+
+## Reading the file in Node.js
+
+Use `readline` with `createReadStream` to iterate line by line without
+materialising the whole file. The example below also strips the `photo` field
+immediately after parsing so the rest of the pipeline never touches the image
+data.
+
+```javascript
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+
+const rl = createInterface({
+  input: createReadStream("content/apr_2024/assets/messages.jsonl"),
+  crlfDelay: Infinity,
+});
+
+for await (const line of rl) {
+  if (!line.trim()) continue;
+
+  // Strip photo immediately — never carry base64 into downstream processing
+  const { photo, ...msg } = JSON.parse(line);
+
+  console.log(msg.id, msg.date, msg.content.slice(0, 60));
+}
+```
+
+<Note>
+  `generate-signals.mjs` uses exactly this pattern when it builds signals.
+  The very first thing it does after parsing a line is destructure the photo
+  away:
+
+  ```javascript
+  const { photo, ...msg } = row;
+  ```
+
+  Only the photo-free `msg` object ever enters the keyword filter or the LLM
+  pipeline.
+</Note>

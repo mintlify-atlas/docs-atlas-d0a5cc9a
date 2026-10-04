@@ -1,0 +1,74 @@
+---
+title: "Signal Dataset: Crypto Signal Research Corpus"
+sidebarTitle: "Introduction"
+description: "Signal Dataset provides 9,189 raw Telegram posts and 921 structured crypto trading signals from WallstreetQueenOfficial, covering May 2021 to September 2026."
+---
+
+Signal Dataset is an open research corpus built for quantitative analysts, backtesting engineers, and crypto researchers who want ground-truth signal data without scraping it themselves. It packages every post ever published by the public Telegram channel [WallstreetQueenOfficial](https://t.me/WallstreetQueenOfficial) together with the LLM extraction pipeline that converted those posts into machine-readable trading signals. Whether you want to replay five years of channel history through your own backtesting framework or study how a retail signal provider's calls behaved in live markets, the dataset gives you both the raw material and a reproducible path to recreate it.
+
+## What the dataset contains
+
+The corpus has a dual nature. On one side it is a **raw data archive**: every post, including attached images, preserved exactly as it appeared on the channel. On the other side it is a **structured signal corpus**: each post that looked like a trade call has been passed through an LLM (Ollama `gemma4:31b-cloud`) with a carefully tuned prompt, and the extracted signal — ticker, direction, entry range, targets, stop-loss — has been stored as a JSON object alongside the source post that produced it.
+
+### Dataset statistics
+
+| Metric | Value |
+|---|---|
+| Raw channel posts | 9,189 |
+| LLM-extracted verdicts | 921 |
+| — Long signals | 521 |
+| — Short signals | 294 |
+| — Wait / non-trade verdicts | 106 |
+| Tickers with full 1-minute candle coverage | 82 |
+| Monthly folders | 65 |
+| Date range | 7 May 2021 – 30 September 2026 |
+
+<Tip>
+`jan_2023` contains raw posts in `messages.jsonl` but has no `signals.jsonl` file — no post in that month passed the keyword pre-filter, so the LLM was never invoked and no signal file was written.
+</Tip>
+
+## Purpose
+
+The dataset is the input layer for backtesting a signal-following strategy and for calibrating its exits. The core idea is to accept from the channel author only the **direction and the moment of entry**, then replace the author's own targets, stop-loss, and leverage with exits derived from how the channel's signals actually behaved historically:
+
+1. Every signal opens a position held untouched for 24 hours; a per-minute net PnL trajectory is recorded.
+2. Trajectories are split into winners and losers, and their separability is verified.
+3. Exit thresholds — hard stop, per-minute PnL floor, profit lock, trailing take — are fitted as low-parameter curves and validated against a "hold until the 24-hour horizon, with liquidation" baseline.
+
+The backtesting and calibration logic lives in a separate `backtest-kit` project. This repository holds only the data, the extraction pipeline, and the design document.
+
+## Repository layout
+
+```
+ARCHITECTURE.md            Exit-calibration plan: model, procedures, worked numeric example (Russian)
+assets/target_tickers.txt  82 *USDT symbols with gap-free Binance spot candles over the whole range
+content/<mon>_<year>/      One folder per month, may_2021 … sep_2026
+  assets/messages.jsonl      Raw channel posts for that month
+  assets/signals.jsonl       LLM-extracted signals for that month
+  prompt.mustache            Extraction prompt, tuned to the post format of that period
+  generate-signals.mjs       messages.jsonl -> signals.jsonl generator
+scripts/                   Scraping, validation and batch-run helpers
+```
+
+Because the channel's post format evolved over five years, each monthly folder carries its own `prompt.mustache` with period-specific examples and formatting rules. The prompts are not interchangeable — running a 2024 prompt against 2021 posts will produce degraded results.
+
+<Note>
+The `content/` directory is stored in **Git LFS** and weighs approximately **420 MB**. You must run `git lfs pull` after cloning before any of the data files are accessible. Without it, every `messages.jsonl` and `signals.jsonl` will be an LFS pointer stub rather than real content.
+</Note>
+
+## Explore the docs
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Clone the repo, install dependencies, and generate your first signals in minutes.
+  </Card>
+  <Card title="Messages Schema" icon="database" href="/data/messages-schema">
+    Full field reference for `messages.jsonl` and `signals.jsonl`, including zero-encoding conventions.
+  </Card>
+  <Card title="How the Pipeline Works" icon="microchip" href="/pipeline/how-it-works">
+    Step-by-step walkthrough of keyword filtering, ticker extraction, LLM prompting, and resumability.
+  </Card>
+  <Card title="Exit Calibration Architecture" icon="chart-line" href="/architecture/exit-calibration">
+    The statistical model used to fit and validate exit thresholds from PnL trajectories.
+  </Card>
+</CardGroup>

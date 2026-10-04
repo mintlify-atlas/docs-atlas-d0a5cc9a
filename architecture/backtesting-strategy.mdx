@@ -1,0 +1,285 @@
+---
+title: "Backtesting Strategy: Trajectory Collection and Replay"
+sidebarTitle: "Backtesting Strategy"
+description: "How the 24-hour trajectory collector (main.test.ts) and the strategy executor (main.strategy.ts) work together, including the dump format, generated level grids, and listener implementation."
+---
+
+The backtesting pipeline is split into two files with a strict division of labour. `main.test.ts` is the **trajectory collector**: it runs every signal as a 24-hour position with nothing allowed to close it early, so the engine writes a complete per-minute net PnL trajectory to the dump. `main.strategy.ts` is the **strategy executor**: it reads the calibrated level grids and applies them as listeners that fire exactly as they will in production. The collector produces the data that the calibration pipeline consumes; the strategy executor replays those calibrated curves and must reproduce every closure that the offline replay predicted.
+
+## Trajectory Collector (`main.test.ts`)
+
+The collector's only job is to produce trajectories with nothing interfering. It achieves this with two unreachable thresholds: a stop-loss at −50% of the position and a take-profit at +50%. Neither is realistically reached in 24 hours, so `minuteEstimatedTime: 24 * 60` becomes the sole exit.
+
+```typescript
+import { addStrategySchema, Cache, Position, setConfig } from "backtest-kit";
+
+setConfig({
+  CC_MAX_STOPLOSS_DISTANCE_PERCENT: 100, // required for the validator to accept a −50% stop
+});
+
+const NEVER_STOP_PERCENT = 50;
+```
+
+The entry function returns:
+
+```typescript
+return {
+  id: `${entry.id}-${entry.symbol.toLowerCase()}`,
+  symbol: entry.symbol,
+  ...Position.moonbag({
+    position: entry.position,
+    currentPrice,
+    percentStopLoss: NEVER_STOP_PERCENT, // stop at −50% — practically unreachable
+  }),                                    // moonbag take-profit is fixed at +50% — also unreachable
+  note: JSON.stringify(info, null, 2),   // photos must be omitted: omit(message, "photo")
+  minuteEstimatedTime: 24 * 60,          // the only real exit: exactly 1440 minutes
+};
+```
+
+`Position.moonbag` returns `{ position, priceTakeProfit, priceStopLoss }`. Both boundaries are 50% away from the current price and are almost never reached, so the position survives to the time exit and the engine writes 1440 per-minute ticks.
+
+**No `listenActivePing` or `commit*` calls appear anywhere in the test file.** Any listener would intervene in the trajectory, making it describe a different process than the one the calibrated curves will be applied to.
+
+### Entry via the Production Pipeline
+
+Trajectories must start from the same moment and conditions the production strategy would use. If the collector uses a different cache, a different freshness window, or different quality gates, the calibrated curves describe a process that production will never see.
+
+<Steps>
+  <Step title="Same cache">
+    Use the same `Cache.file` (5m interval, production cache name). Cached LLM responses are reused for free.
+  </Step>
+  <Step title="Same freshness gate">
+    Apply the same maximum staleness window: `when - message.date > FRESH_WINDOW_MINUTES → null`.
+  </Step>
+  <Step title="Quality gates (optional relaxation)">
+    Quality gates (minimum targets, etc.) may be removed in the collector so that trajectories for all signals are captured. Production filters are applied offline via the `note` field during calibration. The gate relaxation is to make filters reproducible offline — not to calibrate on an unfiltered ensemble.
+  </Step>
+</Steps>
+
+### Collector Properties to Know
+
+- While a position is active, new signals for the same symbol are not opened. On the current channel, the author posts per symbol approximately once a week (G.1 in the architecture), so overlapping signals are not a practical problem — but this property is verified by the cadence check during onboarding.
+- Trajectories cut by the collector's own boundaries (stop at −50, take at +50, frame edge) are **excluded from the curve fit** but must remain in both arms of the replay, flagged as truncated. The mismatch between the collector's cut (−50) and the production liquidation (−8 to −20 net, depending on leverage) is resolved by the liquidation cap in the baseline: anything deeper than `L_liq` is already capped, and the collector's stop at −50 is always deeper than any realistic liquidation.
+- Monthly dumps are tens of megabytes; read the JSONL file as a stream.
+
+## The Dump Format (`dump/report/backtest.jsonl`)
+
+One line = one event. All relevant data is in the `data` field.
+
+<Tabs>
+  <Tab title="opened">
+    Entry event. Emitted once per signal when the position opens.
+
+    | Field | Description |
+    |---|---|
+    | `action` | `"opened"` |
+    | `signalId` | Signal identifier |
+    | `position` | `"long"` or `"short"` |
+    | `priceOpen` | Entry price |
+    | `openTime` | Entry timestamp in milliseconds |
+    | `note` | JSON string with the original signal's targets, stop, and author metadata |
+  </Tab>
+  <Tab title="active">
+    Per-minute snapshot. Emitted once per minute while the position is open.
+
+    | Field | Description |
+    |---|---|
+    | `action` | `"active"` |
+    | `timestamp` | Snapshot timestamp in milliseconds |
+    | `pnl` | Net PnL percentage (directional — sign already correct for shorts) |
+    | `peakProfitPercentage` | Running maximum net PnL = **MFE(t)** |
+    | `maxDrawdownPercentage` | Running minimum net PnL = **MAE(t)** |
+
+    Minute index: `t = (timestamp - openTime) / 60000`
+
+    The engine computes MFE and MAE as running max/min internally — do not maintain separate State for them.
+  </Tab>
+  <Tab title="closed">
+    Final event. Emitted once when the position closes.
+
+    | Field | Description |
+    |---|---|
+    | `action` | `"closed"` |
+    | `pnl` | Final net PnL percentage |
+    | `duration` | **Number of ticks** (count, not last index). Full trajectory = 1440. |
+    | `closeReason` | Reason string (`"time"`, `"stop_loss"`, etc.) |
+
+    **`duration` is a count, not an index.** A signal with 850 one-minute ticks has `duration: 850`. To check whether a trajectory is full: `duration >= T`.
+
+    **Do not use `closed.pnl` for winner labelling when T < 1440.** Winner labelling uses `pnl[T−1]` with the liquidation cap applied. A trajectory that dipped below `L_liq` and recovered to positive will show a positive `closed.pnl` (the collector's −50% stop is deeper than any real liquidation), but it is a *loser* — the baseline would have liquidated it.
+  </Tab>
+</Tabs>
+
+All extremes are from per-minute VWAP(5m)-price ticks — double smoothing relative to raw trades (minute discretisation plus VWAP averaging). The calibration therefore describes exactly the process that the listener observes, and the assumption "close at the observed minute's price" is recorded in the calibration passbook as a known gap between backtest and live execution (slippage and execution delay in production).
+
+## Generated Level Grids (`levels.gen.ts`)
+
+No threshold number is ever written by hand. Every value is compiler output that has passed the validation procedure, with a full passbook in the file header. The grid step is one minute: lookup in `Level` is O(1), the listener ticks once per minute, and coarser grids lose curve shape.
+
+```typescript
+// levels.gen.ts — GENERATED; do not edit by hand. Regenerated on every recalibration.
+export const WORK_HORIZON_T = 1080;      // working horizon in minutes; T < 1440
+export const WORK_LEVERAGE = 10;         // λ; L_liq and the liquidation-depth check derive from this
+
+// pnl_floor: floor(t) = a − b·e^(−t/τ), a=−1.1 b=3.4 τ=152 min; anchor floor(0) = hardStop = −4.5
+//   CALIBRATION bootstrap (no refit, CRN): target upperCI(harm) ≤ 5%, actual: point 3.2%, upperCI 4.9%
+//   VALIDATION bootstrap (with refit, §4.5-2) — separate and not bounded by the target: harm 4.6% [CI 2.1..7.8]
+//   n=187, period=2026. Hard stop: 0 observed kills; rule-of-three upper bound: 3/187 = 1.6%
+export const PNL_FLOOR_GRID: Record<number, number> = {
+  0: -4.5, 1: -4.48, 2: -4.46, /* ... every minute up to T−1 ... */ 1079: -1.1,
+};
+
+// profit_lock (killer with grace): lock(t) = c·(1 − e^(−(t−t_arm)/κ)), c=2.15 κ=490
+//   t_arm = 150 — node on the control-minute grid (grid step 15 min — procedure constant)
+//   G = 480. Grid published from key max(t_arm+1, G) = 480: lock(t_arm) = 0 by construction;
+//   keys 151..479 are dead (court no earlier than t_cross + G ≥ G); key G = 480 is the
+//   insurance for a positive first tick (t_cross = 0): court legally starts at t = G, and a
+//   null in the grid would create a one-minute gap between the listener and replay.
+//   Delta passbook: "delta is point estimate only; admitted as non-loss capital releaser."
+//   Invariant arm > lock(T−1) verified by compiler (sufficient form: arm > c).
+export const PROFIT_LOCK_GRID: Record<number, number> = {
+  480: 1.054, 481: 1.056, /* ... every minute up to T−1 ... */ 1079: 1.83,
+};
+export const LOCK_GRACE_MINUTES = 480;       // G: q75 of catch-up time, whole minutes (§4.3)
+export const TRAILING_ARM: number | null = null;     // null = disabled by CI rule (§4.4)
+export const TRAILING_RETRACE: number | null = null;
+```
+
+### The `Level` Class
+
+`Level.match(minutesActive)` returns the value of the greatest key ≤ `minutesActive`. If `minutesActive` is below the minimum key in the grid, it returns `null`. This means:
+
+- The floor is always active (its minimum key is 0).
+- The lock returns `null` before its arming minute and inside the dead zone of the grace period — the listener's `null` check correctly suppresses those minutes without any additional guard.
+
+```typescript
+import { Level } from "backtest-kit";
+import {
+  PNL_FLOOR_GRID,
+  PROFIT_LOCK_GRID,
+  LOCK_GRACE_MINUTES,
+  WORK_HORIZON_T,
+} from "./levels.gen";
+
+const PNL_FLOOR_LEVEL = new Level(PNL_FLOOR_GRID);   // value at minute 0 = hardStop anchor
+const PROFIT_LOCK_LEVEL = new Level(PROFIT_LOCK_GRID);
+```
+
+## Strategy Listeners (`main.strategy.ts`)
+
+`listenActivePing` fires every minute while a position is active — the same discretisation as the calibration. Comparisons are always net PnL against net thresholds.
+
+### Listener Registration Order
+
+Listener registration order is calibration-critical. The engine calls callbacks in registration order, and after a position is closed the remaining listeners in the same minute are not called. The blocks must be registered in the convention order used by the replay: **floor → lock → trailing**. A reordered block silently changes which mechanism gets credit in a minute where two thresholds are both touched; the validation cross-check (§4.5-5) will detect this as a "bug."
+
+### PnL Floor Listener
+
+```typescript
+import {
+  commitClosePending,
+  commitSignalNotify,
+  getPositionActiveMinutes,
+  listenActivePing,
+  State,
+} from "backtest-kit";
+
+// Floor (§4.2): ordinary losses + lower anti-limbo
+listenActivePing(async ({ symbol, data }) => {
+  const minutesActive = await getPositionActiveMinutes(symbol);
+  const floor = PNL_FLOOR_LEVEL.match(minutesActive);
+  if (floor === null) return;
+  if (data.pnl.pnlPercentage > floor) return;   // net vs net
+  await commitSignalNotify(symbol, { notificationNote: "pnl_floor: closing on floor" });
+  await commitClosePending(symbol);
+});
+```
+
+### Profit Lock Listener
+
+The lock requires one piece of per-position state that the engine does not expose directly: the minute the position first went positive (`t_cross`). Peak and drawdown come from `data` — the engine maintains them as running max/min internally, and they match exactly what appears in the dump as `peakProfitPercentage` and `maxDrawdownPercentage`. Maintaining a separate `State` for peak would risk desync.
+
+```typescript
+// Profit lock (§4.3): killer of lagging winners with zero-crossing grace G.
+// The engine's running peak is data.peakProfit.pnlPercentage — same series used
+// in calibration. Do NOT maintain a separate State for the peak.
+// Convention: the crossing minute records t_cross and is never judged.
+// Court begins at max(t_cross + 1, t_cross + G) — identical rule in fit, replay, listener.
+const CROSS_STATE = new State({
+  initialData: { crossMinute: null },
+  name: "lock_cross_state",
+});
+
+listenActivePing(async ({ symbol, data }) => {
+  const minutesActive = await getPositionActiveMinutes(symbol);
+  const pnl = data.pnl.pnlPercentage;
+  const { crossMinute } = await CROSS_STATE.getState();
+
+  if (crossMinute === null && pnl > 0) {
+    await CROSS_STATE.setState({ crossMinute: minutesActive }); // record t_cross
+    return;                                                     // crossing minute is never judged
+  }
+
+  const lockLevel = PROFIT_LOCK_LEVEL.match(minutesActive);
+  if (lockLevel === null) return;                  // before arming / inside grace dead zone
+
+  if (crossMinute === null || minutesActive - crossMinute < LOCK_GRACE_MINUTES) return; // grace
+
+  if (pnl > 0 && data.peakProfit.pnlPercentage < lockLevel) {
+    await commitSignalNotify(symbol, {
+      notificationNote: "profit_lock: lagging behind winner pace",
+    });
+    await commitClosePending(symbol);
+  }
+});
+```
+
+### Trailing Take Listener
+
+```typescript
+// Trailing take (§4.4): capture runners.
+// TRAILING_ARM and TRAILING_RETRACE are null when disabled by the CI rule.
+listenActivePing(async ({ symbol, data }) => {
+  if (TRAILING_ARM === null || TRAILING_RETRACE === null) return;
+  const peak = data.peakProfit.pnlPercentage;
+  const pnl = data.pnl.pnlPercentage;
+  if (peak >= TRAILING_ARM && pnl <= peak - TRAILING_RETRACE) {
+    await commitSignalNotify(symbol, { notificationNote: "trailing_take: runner retraced" });
+    await commitClosePending(symbol);
+  }
+});
+```
+
+<Tip>
+`State` scope is per-symbol: the class handles routing internally via async-hooks context. When a position closes, the engine resets its state automatically — `crossMinute` does not survive into the next position for the same symbol. Do not call `State.enable()` manually; the CLI does it.
+</Tip>
+
+## Go/No-Go Separability Check
+
+Before any calibration, the first script checks whether the winner and loser populations are statistically distinguishable. The verdict is **per-mechanism**, because different mechanisms feed from different series:
+
+- **Floor** feeds from MAE(t) — if KS on MAE shows separation, the floor can be calibrated.
+- **Lock** feeds from MFE(t) — separation must persist for k consecutive control minutes to establish the arming minute `t_arm`.
+- **pnl(t)** separation is purely diagnostic — no mechanism feeds from it and it does not enter any verdict.
+
+The KS critical value at significance level α with sample sizes n (winners) and m (losers):
+
+```text
+critical = 1.358 · √((n + m) / (n · m))
+```
+
+The `t_arm` is the first control-minute grid node at which KS(MFE) exceeds this critical value for k consecutive control minutes (production: α=0.05, k=3, grid step 15 minutes — all three are frozen procedure constants).
+
+<Note>
+KS for `t_arm` is always run on the **full** population (winners vs. losers), never on the post-floor survivors. The floor nearly eliminates losers, making KS on the post-floor population a degenerate object. `t_arm` is a property of the channel; κ, G, and c are properties of the mechanism on its working population.
+</Note>
+
+**Channel-level no-go:** if neither MAE nor MFE shows separation at any control minute, or if separation appears only near the end of the horizon, there is no profile to work with. The channel is traded at the baseline or dropped. A channel with strong MAE separation and weak MFE separation runs with "floor active, lock disabled" — a valid configuration, not a failure.
+
+<Warning>
+**Two acknowledged coverage holes.** The exit stack does not cover two bands of PnL, and they are covered only by the terminal time-exit at horizon T (maximum T minutes, range ≤ 18 hours):
+
+1. **Lower hole:** `floor(t) < pnl ≤ 0` — deliberate mild-loss zone. The floor rises toward its asymptote `a < 0` and never crosses zero. A position slowly bleeding between `floor(t)` and zero is not closed by the lock (which requires `pnl > 0`) and not by the floor (it has not touched it). Only time-exit closes it.
+
+2. **Upper hole:** peaks in `(lock(T−1), arm)` — a position whose peak exceeded the lock's in-horizon ceiling (`lock(T−1)`) but stayed below the trailing-take arm. With trailing disabled (`arm = null`, the expected Phase 1 outcome), the hole extends from `lock(T−1)` to infinity. A position that peaked at +4% and fell back to +0.3% is not caught by the lock (its peak was above `lock(T−1)`) and not by trailing (the mechanism is off). Only time-exit closes it. This is the accepted cost of choosing a killer over a ratchet.
+</Warning>

@@ -1,0 +1,247 @@
+---
+title: "Regime Calibration: Market Condition Adaptive Curves"
+sidebarTitle: "Regime Calibration"
+description: "How 12 monthly trajectory runs feed regime-specific exit curves for bullish, bearish, and sideways market conditions, with a global NEUTRAL fallback and a phased deployment plan."
+---
+
+Exit curves that are honest inside one market regime will misfire at its boundaries. A floor calibrated on a volatile bull-run month is tighter than the data justifies in a quiet sideways period; a floor calibrated on a sideways month becomes recklessly soft when volatility spikes. Adapting curves by market condition improves accuracy — but only where the trajectory sample is large enough to support a reliable regime-specific fit, and only after proving that a regime-specific curve is actually better than the global fallback. The design accordingly treats regime curves as an upgrade that must earn their way in rather than a default that may be disabled.
+
+## The Regime Structure
+
+The 12-month calibration year is divided into monthly run pairs. Each month gets its own `main.test.ts` (trajectory collector, time-framed to that month) and its own `main.strategy.ts` (replay with the current level grids). All strategies share a single generated module:
+
+```text
+config/
+  levels.ts     — one generated module imported by every strategy
+content/
+  jan_2026/
+    main.test.ts       — collector for January
+    main.strategy.ts   — executor for January
+  feb_2026/
+    main.test.ts
+    main.strategy.ts
+  ...
+```
+
+Four regime variants are defined:
+
+| Variant | Description |
+|---|---|
+| `BULLISH_` | Calibrated on trajectories labelled as bullish-market entries |
+| `BEARISH_` | Calibrated on trajectories labelled as bearish-market entries |
+| `SIDEWAYS_` | Calibrated on trajectories labelled as sideways-market entries |
+| `NEUTRAL_` | Global fit on all trajectories — the fallback for any unlabelled or inadmissible regime |
+
+**Regime variants apply to floor and lock only.** Hard stop (the floor anchor) and trailing take are always global — their tail statistics require the full population and cannot be estimated reliably from a regime sub-pool of 25–40 winners.
+
+## The Causal Market Regime Classifier
+
+The classifier must use only information available at the moment of entry. Look-ahead into the position's future is forbidden.
+
+**Data source:** `getCandles("BTCUSDT", "1d", 30)` — BTC serves as the market proxy. The `getCandles` API cannot look ahead in backtesting; the no-look-ahead constraint is enforced by the data layer.
+
+**Two metrics computed at entry time:**
+
+| Metric | Formula |
+|---|---|
+| Trend | 30-day return: `close[29] / close[0] − 1` |
+| Volatility | Standard deviation of daily log-returns over the 30-day window |
+
+**Classification rule:**
+
+```text
+if |trend| < trend_threshold:
+    regime = SIDEWAYS
+else if trend > 0:
+    regime = BULLISH
+else:
+    regime = BEARISH
+```
+
+Thresholds are compiled from quantiles of the calibration year's metrics, with a mandatory buffer zone ±ε on both sides. If a metric falls inside the buffer zone, the signal is routed to `NEUTRAL_`. Twelve monthly data points make the quantile estimates coarse; the buffer zone catches the most uncertain transition months.
+
+**The regime is fixed at entry and never changed for the lifetime of the position.** The classifier is called once in `getSignal`, the result is stored in `payload`, and the listeners read from there. Mid-position curve switching is prohibited: a splice cannot be verified by replay.
+
+## Causal Trajectory Labelling
+
+Each trajectory receives a regime label at its entry time using the same classifier rule applied to the BTC candles trailing that entry. This is **not** month-level labelling.
+
+Labelling a trajectory by the month it belongs to and then fitting regime curves on that month's candles would break the alignment between calibration and production: the calibration would use a regime label derived from information the production classifier does not have (the full month's candles, including candles after the entry). Causal labelling ensures the training pools and the live classifier are identical by construction.
+
+The unit of cross-validation is the **monthly block**. Trajectories within a month are correlated (they share the same market environment), so leave-one-trajectory-out would underestimate variance. The correct unit is leave-one-month-out.
+
+## Regime Admission Procedure
+
+A regime curve must earn its admission by beating the global `NEUTRAL_` fallback on data it has never seen.
+
+<Steps>
+  <Step title="Leave-one-month-out split">
+    Fit the regime curve (floor and lock) on 11 months of causally labelled trajectories, holding the 12th month out.
+  </Step>
+  <Step title="Honest NEUTRAL_ baseline">
+    Refit `NEUTRAL_` on the same 11 months — **not** the full-year `NEUTRAL_`. A `NEUTRAL_` that has seen the test month is not a fair baseline.
+  </Step>
+  <Step title="Replay on the excluded month">
+    Run both curves on the held-out month's trajectories. Compute delta versus the liquidation baseline with bootstrap CIs for both curves.
+  </Step>
+  <Step title="Admission gate">
+    The regime curve is admitted if it is not worse than the honest `NEUTRAL_` on the excluded months, by bootstrap CI. If the regime curve fails or if there are not enough months with sufficient trajectory counts, the regime is not published — the classifier routes those entries to `NEUTRAL_`.
+  </Step>
+  <Step title="Expected asymmetry">
+    In a year dominated by one regime (e.g. a bull run), `BEARISH_` may have too few trajectories to calibrate and will simply fall back to `NEUTRAL_`. This is correct behaviour — it reflects the data, not a defect.
+  </Step>
+</Steps>
+
+## Why NEUTRAL_ Fallback Is Safe and Regime Curves Are Not
+
+The two error directions are fundamentally asymmetric:
+
+<Tabs>
+  <Tab title="NEUTRAL_ error direction">
+    `NEUTRAL_` is calibrated on the full-year ensemble. Its tail behaviour is dominated by the most volatile periods. In a quiet regime, the floor's trigger threshold is softer than the period's data would support — it fires less often than a regime-specific floor would.
+
+    **Consequence:** convergence toward the baseline. Efficiency loss, not losses. The delta is reduced; winners are not killed in bulk.
+  </Tab>
+  <Tab title="Regime curve error direction">
+    A `SIDEWAYS_` floor calibrated on ~30 winners is tight by construction. If the market regime classifier makes an error — a threshold from 12 data points plus an uncertain buffer zone mislabels a volatile month as sideways — that tight floor fires aggressively into a storm.
+
+    **Consequence:** systematic winner kills in bulk. This is the only failure mode of the stack that generates losses rather than foregone efficiency gains. The buffer zone ±ε catches some transitions, but ε is itself derived from the same 12 data points.
+  </Tab>
+</Tabs>
+
+<Note>
+The upside of regime curves is a few percentage points of efficiency gain when classification is correct. The downside is systematic winner kills when the classifier mismatches the market. At first-year sample sizes, this is a bad trade. The three-phase deployment plan below is designed to avoid buying the cure before confirming the disease.
+</Note>
+
+## Three-Phase Deployment Plan
+
+### Phase 1 — First Year (Production)
+
+Deploy **`NEUTRAL_` plus global hard stop only**. The classifier runs as an **attributor**: it computes the regime label and writes it to `payload`/`note`, but the exit curves do not depend on it. All positions use the same `NEUTRAL_` floor and lock (if those pass their own calibration gates; at n≈187 the lock and trailing take will likely be disabled by their gates — expected, not a defect).
+
+Expected configuration at first-year sample sizes:
+
+| Mechanism | Expected status |
+|---|---|
+| Floor | Active (global `NEUTRAL_`) |
+| Liquidation | Always active (exchange) |
+| Time exit at T | Always active (framework) |
+| Lock | Possibly disabled — gate requires MFE separation |
+| Trailing take | Likely disabled — gate requires runners present in ≥75% of resamples |
+
+Record expectations before looking at data. Adjusting the procedure constants after seeing out-of-sample numbers is overfitting through the back door.
+
+### Phase 2 — Offline Analysis
+
+Slice the `NEUTRAL_` replay by causal labels from Phase 1. Ask one question:
+
+> **Is there a regime where `NEUTRAL_` systematically underperforms the baseline, or leaves a notable amount on the table?**
+
+If the answer is no — the `NEUTRAL_` curve performs acceptably across all three regime labels — regime-specific curves add no value. The calibration section collapses to "classifier as attributor" and the design remains simpler and less brittle.
+
+Phase 2 is the gate that justifies Phase 3. Skipping it means buying a cure without confirming the disease.
+
+### Phase 3 — Regime Curves (Only If Phase 2 Shows a Problem)
+
+Enable regime curves one at a time, starting with the most-populated regime, on second-year data. Each regime goes through the full admission procedure. Failure at the admission gate routes that regime back to `NEUTRAL_` permanently.
+
+## The `config/levels.ts` Structure
+
+```typescript
+// config/levels.ts — GENERATED; passbook for each grid in the comment above it
+export const REGIME_THRESHOLDS = {
+  // classifier thresholds compiled from calibration-year quantiles + ε buffer zone
+  trendBullish: 0.12,
+  trendBearish: -0.10,
+  volSidewaysMax: 0.018,
+  epsilon: 0.02,
+};
+
+// Regime-specific: floor and lock only (central statistics; n is workable)
+export const BULLISH_PNL_FLOOR_GRID: Record<number, number> = { /* keys 0..T−1 */ };
+export const BULLISH_PROFIT_LOCK_GRID: Record<number, number> = { /* ... */ };
+export const BULLISH_LOCK_GRACE_MINUTES: number = /* ... */;
+
+export const SIDEWAYS_PNL_FLOOR_GRID: Record<number, number> = { /* ... */ };
+// (SIDEWAYS_PROFIT_LOCK_GRID published only if lock passes its admission gate)
+
+export const BEARISH_PNL_FLOOR_GRID: Record<number, number> = { /* ... */ };
+
+export const NEUTRAL_PNL_FLOOR_GRID: Record<number, number> = { /* ... */ };  // global fallback
+export const NEUTRAL_PROFIT_LOCK_GRID: Record<number, number> = { /* ... */ };
+export const NEUTRAL_LOCK_GRACE_MINUTES: number = /* ... */;
+
+// Global: tail statistics — regime sub-pools are too small
+export const HARD_STOP: number = /* ... */;           // floor anchor (§4.1)
+export const TRAILING_ARM: number | null = /* ... */; // null = disabled by CI rule (§4.4)
+export const TRAILING_RETRACE: number | null = /* ... */;
+```
+
+The classifier in `getSignal` reads `REGIME_THRESHOLDS`, sets the label, and stores it in `payload`. The listeners read the label from `payload` and select the appropriate grid. No curve switching happens mid-position.
+
+## The Edge Hypothesis
+
+Understanding *why* the channel's signals have edge matters for how the model is designed. The dominant hypothesis — partially confirmed by the channel prototype's own data — is that the channel's edge does not come from the author's private information, but from **the flow of the channel's own audience executing the published levels**.
+
+When the author publishes an entry zone and targets, tens of thousands of subscribers place limit orders at those exact levels. The publication creates the level: it is the same mechanism behind round numbers and Fibonacci retracements — every market participant watches the same numbers, and the aggregate of their orders makes those numbers real.
+
+### Evidence from the Prototype Channel
+
+An event study on the prototype channel (crypto-yoda) showed that the entry zone described in a post functions as a wall of limit orders from late subscribers. When the price returns to the zone, it meets real support or resistance that exists independently of whether the original signal contained any information.
+
+### The Full Mechanism Chain
+
+<Steps>
+  <Step title="Market orders at publication">
+    Fast subscribers hit the market on publication. The entry signal has an edge within the first 15 minutes; the freshness gate is designed to front-run the slow part of the audience.
+  </Step>
+  <Step title="Limit orders in the entry zone">
+    The entry zone becomes a real order wall — confirmed by the event study. Price returning to the zone encounters genuine support from queued limit orders.
+  </Step>
+  <Step title="Take-profit orders at the author's targets">
+    The author's published targets become counter-order walls. The crowd's take-profits at those levels create real resistance, which is why the price often stalls at them.
+  </Step>
+  <Step title="Liquidity scaling">
+    The effect is inversely proportional to the token's liquidity. On BTC, the audience flow is negligible. On small altcoins, tens of thousands of leveraged subscribers can be a significant share of daily volume.
+  </Step>
+</Steps>
+
+### Competing Hypotheses
+
+| Hypothesis | Description | How to distinguish |
+|---|---|---|
+| Audience flow | The crowd's own orders create the price effect | Pre-drift analysis: directional move before vs. after the post |
+| Trend riding | The author posts in the direction of an already-running trend | Pre-drift analysis |
+| Genuine alpha | The author has real private information | Harder to test; would survive the pre-drift filter |
+
+The first two are separated by **pre-drift analysis**: measuring the directional move *before* the post versus *after* it. All three are testable on the annual trajectory corpus.
+
+### Testable Consequences
+
+- PnL effect should scale inversely with the token's average trading volume (MFE vs. liquidity).
+- `"92% accuracy"` reports can be arithmetically honest without skill: the crowd pushes price to TP1, but the real test is performance on distant targets and stops.
+- **Fragility to audience size:** declining channel engagement predicts edge decay before walk-forward metrics catch it. Monitor channel activity alongside calibration passbooks.
+
+### Implication for the Model Design
+
+If the hypothesis is correct, the author's direction and entry moment are the parts worth keeping. Their explicit targets and stops are not forecasts of where the price is going — they are the levels around which the audience's orders cluster. Replacing the author's risk-management with calibrated exits is not an improvement of the author's work; it is a recognition that their role is direction-and-timing, not position management.
+
+## New Channel Onboarding Checklist
+
+All channels are found via their public track records. That selection process introduces survivorship bias: a channel appears on the shortlist because its visible history looks good, not because it was randomly sampled. Every new channel is a survivorship artefact until it passes on data the selection process did not see.
+
+<Steps>
+  <Step title="Pre-drift analysis">
+    Measure the directional price move in the hour or day *before* the post against the move *after* it. Strong pre-drift means the author is trend-following a move that is mostly over; no pre-drift is consistent with the audience-flow or genuine-alpha hypotheses.
+  </Step>
+  <Step title="Cadence check">
+    Verify post frequency and regularity. Will the monthly trajectory count support calibration? Are there "burst months" followed by dead months that would make the sample correlated in ways the block-bootstrap does not capture? Does the author post per symbol rarely enough that overlapping positions are not a problem (G.1)?
+  </Step>
+  <Step title="Held-out confirmation window">
+    Designate a period that was not seen during channel selection. Before enabling any calibrated exit mechanisms, the channel must pass the baseline (liquidation + time-exit) on this window. A channel that looked good on its public history and still looks good on a held-out window is one that the selection process did not fully explain away.
+  </Step>
+</Steps>
+
+<Warning>
+The calibration passbooks carry a known asymmetry. The upside of enabling regime-specific curves — a few percentage points of efficiency gain when classification is correct — is modest. The downside — a tight regime-specific floor killing winners in bulk when the classifier mismatches the market — is not modest. At the sample sizes of a first year of data, that trade is unfavourable. Enable regime curves only after Phase 2 confirms the disease they are meant to treat.
+</Warning>

@@ -1,0 +1,218 @@
+---
+title: "Helper Scripts: Validate, Inspect, and Audit the Dataset"
+sidebarTitle: "Helper Scripts"
+description: "Reference for all helper scripts in the scripts/ directory: reading posts, validating prompts, checking candle coverage, filtering signals, and inspecting the LLM cache."
+---
+
+The `scripts/` directory contains a set of focused utilities for inspecting, validating, and auditing the dataset at every stage of the pipeline. None of them modify `signals.jsonl` or `messages.jsonl` — they are read-only diagnostic and development tools. Reach for them when you are updating a prompt template, adding a new month, auditing ticker coverage, or debugging LLM inference results.
+
+## scripts/read_posts.mjs
+
+Print recent posts from the live channel, or look up specific post IDs by number — the primary tool for studying the channel author's post format when writing or updating a `prompt.mustache`.
+
+```bash
+node scripts/read_posts.mjs            # last 40 posts
+node scripts/read_posts.mjs 100        # last 100 posts
+node scripts/read_posts.mjs 10371 10372  # specific posts by ID
+```
+
+The script calls `scrapePage` from `telegram-reader` to fetch posts directly from the live channel (not from local `messages.jsonl`). If you pass numeric arguments larger than 1000, they are treated as post IDs; smaller numbers are treated as a limit. Each post is printed to stdout in the format:
+
+```text
+=== id=10371 date=2026-09-15T10:22:00.000Z photo=YES len=312
+Coin: #CHZUSDT
+Direction: Long
+...
+```
+
+<Note>
+  `telegram-reader` emits internal resize log lines to stdout alongside the post
+  output. Suppress them when piping the output:
+
+  ```bash
+  node scripts/read_posts.mjs | grep -v "resize begin"
+  ```
+</Note>
+
+<Tip>
+  After adding a new month or encountering unexpected LLM verdicts, use this
+  script to pull the actual post text and compare it against what is stored in
+  `messages.jsonl` — they should be identical.
+</Tip>
+
+## scripts/fetch_photos.mjs
+
+Save post photos as individual JPEG files on disk for visual inspection. Posts in this channel frequently include chart screenshots, and the actual chart content influences what the LLM sees — this script lets you look at those images directly.
+
+```bash
+node scripts/fetch_photos.mjs                    # photos from last 40 posts
+node scripts/fetch_photos.mjs 10371 10369        # specific post IDs
+```
+
+Photos are stored inline in `messages.jsonl` as base64-encoded JPEG strings in the `photo` field. This script fetches from the live channel (via `scrapePage`), decodes those strings, and writes them to the working directory as `photo_<id>.tmp.jpg`.
+
+```text
+10371 saved photo_10371.tmp.jpg (text: Coin: #CHZUSDT ...)
+10369 no photo (or post not found in last 40)
+```
+
+<Note>
+  Output files are named with a `.tmp.jpg` suffix as a reminder to delete them
+  after inspection. They are not tracked by Git and should not be committed.
+</Note>
+
+## scripts/check_filter.mjs
+
+Find posts that look like genuine trading signals but are silently dropped by the keyword pre-filter — helping you identify gaps in the `ENTRY_RE` / `LEVELS_RE` regexes used by `generate-signals.mjs`.
+
+```bash
+node scripts/check_filter.mjs
+```
+
+The script reads every `content/<mon>_<year>/assets/messages.jsonl` file across the full dataset range and applies the same two-regex filter that `generate-signals.mjs` uses:
+
+```javascript
+const ENTRY  = /entry|buy zone|buy:|buy a bag|just buy|buying setup|market price/i;
+const LEVELS = /target|take.?profit|stop/i;
+```
+
+Posts that **pass** the filter are counted. Posts that **fail** the filter but still look like actionable signals — they contain a `*USDT` ticker hashtag, numeric price targets, and are not result reports — are printed as potential false drops:
+
+```text
+passed: 847 | really dropped (USDT, price-targets, not a report): 3
+  [apr_2024 id=6421] #ADAUSDT | Entry: 0.42 - 0.40 | Targets: 0.44 - 0.46...
+```
+
+<Tip>
+  Run this script after adding a new month of messages, or any time you modify
+  the filter regexes, to make sure no actionable signals are being silently
+  discarded. A non-zero dropped count is a signal to review the printed posts
+  and consider updating the regexes.
+</Tip>
+
+## scripts/validate_prompt.mjs
+
+Run the current extraction prompt and JSON schema against a fixed set of known posts — a signal, a result report, and a news/analysis post — and verify that the LLM returns the expected verdicts. This is the regression test for `prompt.mustache`.
+
+```bash
+node scripts/validate_prompt.mjs
+```
+
+The script fetches the required posts directly from the live channel, then runs each through the same `generateObject` pipeline that `generate-signals.mjs` uses (Ollama, `gemma4:31b-cloud`, the inline `TradingPositionFormat` schema). Six test cases are checked:
+
+| Post | Symbol | Expected |
+|---|---|---|
+| Signal post `10371` | `CHZUSDT` | `long`, entry from `0.01598`, stop `0.0152`, 5 targets |
+| Result report `10372` | `CHZUSDT` | `wait` |
+| News update `10374` | `DOGEUSDT` | `wait` |
+| Signal for wrong ticker `10371` | `ETHUSDT` | `wait` |
+| Long signal with 6 targets `10347` | `ETHUSDT` | `long`, entry from `2640`, stop `2500`, 6 targets |
+| Short with 7 targets, annotations `10159` | `DASHUSDT` | `short`, entry from `32.7`, stop `34`, 7 numeric targets |
+
+Each case prints `PASS` or `FAIL` with a description of which fields were wrong:
+
+```text
+PASS CHZUSDT posts=[10371] -> long id=10371
+FAIL DASHUSDT posts=[10159] -> long (failed: position, stoploss)
+  received: {"position":"long","stoploss":0,...}
+```
+
+The script exits with code `1` if any case fails, `0` if all pass.
+
+<Warning>
+  This script requires **Ollama running locally** and the `gemma4:31b-cloud`
+  model available. It will fail immediately if the Ollama endpoint is not
+  reachable.
+</Warning>
+
+<Note>
+  The test case post IDs are pinned to posts from September 2026 (and one from
+  July 2026). If the channel has moved far forward in time and those posts are
+  no longer reachable within a single `scrapePage` call, update the IDs to
+  fresh examples using `scripts/read_posts.mjs`.
+</Note>
+
+## scripts/read_months.mjs
+
+Scan all `signals.jsonl` files across every month, collect every ticker mentioned in signal posts, and cross-check them against the Binance spot market to identify which symbols are active, inactive, or missing entirely.
+
+```bash
+node scripts/read_months.mjs
+```
+
+The script reads all `messages.jsonl` files in the full date range (May 2021 – September 2026) and extracts tickers from posts that contain both `Entry:` and `Stoploss` keywords. Bare hashtags like `#ADA` are normalised to `ADAUSDT`. The resulting list is then checked against the live Binance spot market via `ccxt`:
+
+```text
+unique symbols: 134 ["ADAUSDT","BNBUSDT",...]
+active on spot: 112 [...]
+NOT on spot: 8 [...]
+exists but inactive: 14 [...]
+```
+
+<Note>
+  Use this script when extending the backtest date range, to identify newly
+  mentioned tickers that may or may not have full 1-minute candle coverage on
+  Binance. The output is an audit list — it does not modify any files.
+</Note>
+
+## scripts/check_candles.mjs
+
+Check 1-minute candle coverage on Binance spot for every ticker listed in `assets/target_tickers.txt`, over the full backtest range from 7 May 2021 to 30 September 2026. Reports which symbols have complete coverage, which have gaps, and which were listed or delisted mid-range.
+
+```bash
+node scripts/check_candles.mjs
+```
+
+The script reads the ticker list from `config/loader.config.ts` (the parent `backtest-kit` project's loader configuration), fetches daily OHLCV data for each symbol, and reports:
+
+```text
+FULL COVERAGE (82):
+["ADAUSDT","BNBUSDT",...]
+
+DROP-OUTS (14):
+  LUNAUSDT: delisted 2022-05-14
+  SRMUSDT: delisted 2023-08-04
+  ...
+```
+
+Only symbols that pass this check are included in `assets/target_tickers.txt`. The 82 tickers in that file all have gap-free 1-minute Binance spot candles over the full dataset range.
+
+## scripts/read_cache.mjs
+
+Inspect the LLM response cache that `backtest-kit` stores in MongoDB — the `measure-items` collection in the `backtest-kit` database. Useful for debugging inference results after a test run without re-running the full pipeline.
+
+```bash
+# List all cache buckets and their record counts
+node scripts/read_cache.mjs
+
+# Inspect all non-null LLM verdicts in a specific bucket
+node scripts/read_cache.mjs wallstreet_queen_entry_v1_4h_0
+```
+
+With no arguments, the script prints a summary of all buckets:
+
+```text
+Buckets in measure-items:
+  wallstreet_queen_entry_v1_4h_0: 921 records
+  wallstreet_queen_entry_v2_4h_0: 308 records
+```
+
+With a bucket name, it fetches every record whose `payload.data.entry` is not null and prints a tab-separated summary of each cached verdict:
+
+```text
+CHZUSDT   2024-09-15T10:22  long  post=10371  0.01598-0.0154  sl=0.0152  targets=[0.0164,0.0168,...]
+  The message provides a clear Long Set-Up for CHZ/USDT with explicit entry range...
+```
+
+---
+
+<Note>
+  `scripts/read_months.mjs`, `scripts/check_candles.mjs`, and
+  `scripts/read_cache.mjs` were carried over from the parent backtest project
+  and expect its environment. Specifically: `ccxt` and `mongoose` are **not**
+  listed in this repository's `package.json`, `check_candles.mjs` reads
+  `config/loader.config.ts` from the parent project tree, and `read_cache.mjs`
+  connects to a local MongoDB instance. These three scripts are not
+  standalone — run them from within a configured `backtest-kit` project where
+  those dependencies are available.
+</Note>

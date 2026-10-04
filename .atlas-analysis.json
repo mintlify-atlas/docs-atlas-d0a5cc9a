@@ -1,0 +1,80 @@
+{
+  "projectType": "data-platform",
+  "projectName": "Signal Dataset",
+  "projectDescription": "A research dataset of crypto trading signals scraped from the WallstreetQueenOfficial Telegram channel and converted into structured JSON using an LLM extraction pipeline, intended as input for backtesting signal-following strategies.",
+  "theme": "luma",
+  "primaryColor": "#1f70c2",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Data Reference",
+            "pages": [
+              "data/messages-schema",
+              "data/signals-schema",
+              "data/target-tickers"
+            ]
+          },
+          {
+            "group": "Extraction Pipeline",
+            "pages": [
+              "pipeline/how-it-works",
+              "pipeline/generate-signals",
+              "pipeline/prompt-templates"
+            ]
+          },
+          {
+            "group": "Scraping & Helpers",
+            "pages": [
+              "scripts/fetch-messages",
+              "scripts/helper-scripts"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/exit-calibration",
+              "architecture/backtesting-strategy",
+              "architecture/regime-calibration"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "65 monthly folders of raw Telegram channel posts (9,189 messages, May 2021 – Sep 2026)",
+    "921 LLM-extracted structured trading signals (521 long, 294 short, 106 wait)",
+    "82 USDT symbols with gap-free Binance spot 1-minute candle coverage over the full range",
+    "Resumable per-month signal generation using Ollama (gemma4:31b-cloud) via json-inference",
+    "Month-specific Mustache prompt templates that adapt to evolving post formats",
+    "Keyword pre-filter to isolate actionable entry posts before LLM extraction",
+    "Go/no-go separability check and exit-calibration architecture (ARCHITECTURE.md)",
+    "Parallel batch-run scripts for all 65 months (Linux shell + Windows bat)"
+  ],
+  "publicApiSurface": [
+    "content/<mon>_<year>/generate-signals.mjs — streams messages.jsonl → appends to signals.jsonl",
+    "content/<mon>_<year>/assets/messages.jsonl — raw Telegram posts (id, content, channel, date, photo)",
+    "content/<mon>_<year>/assets/signals.jsonl — LLM verdicts (messageId, symbol, entry, url, message)",
+    "content/<mon>_<year>/prompt.mustache — Mustache extraction prompt for the period",
+    "assets/target_tickers.txt — 82 *USDT symbols with full candle coverage",
+    "scripts/fetch_messages.mjs — scrape channel day-by-day via telegram-reader",
+    "scripts/fetch_photos.mjs — save post photos as JPEG",
+    "scripts/read_posts.mjs — print recent or specific posts",
+    "scripts/check_filter.mjs — find signal-like posts dropped by the keyword pre-filter",
+    "scripts/validate_prompt.mjs — run prompt against known posts",
+    "scripts/read_months.mjs — collect tickers and check against Binance spot",
+    "scripts/check_candles.mjs — verify candle coverage per ticker",
+    "scripts/read_cache.mjs — inspect the LLM cache in MongoDB",
+    "scripts/linux/generate_test_all.sh — run all 65 months chronologically",
+    "scripts/linux/generate_test_1.sh … generate_test_10.sh — 10 parallel shards"
+  ]
+}
