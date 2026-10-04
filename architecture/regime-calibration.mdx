@@ -1,7 +1,7 @@
 ---
 title: "Regime Calibration: Market Condition Adaptive Curves"
 sidebarTitle: "Regime Calibration"
-description: "How 12 monthly trajectory runs feed regime-specific exit curves for bullish, bearish, and sideways market conditions, with a global NEUTRAL fallback and a phased deployment plan."
+description: "NEUTRAL_ as safe fallback, regime curve admission by leave-one-month-out replay, and a phased deployment plan that gates activation on confirmed need."
 ---
 
 Exit curves that are honest inside one market regime will misfire at its boundaries. A floor calibrated on a volatile bull-run month is tighter than the data justifies in a quiet sideways period; a floor calibrated on a sideways month becomes recklessly soft when volatility spikes. Adapting curves by market condition improves accuracy — but only where the trajectory sample is large enough to support a reliable regime-specific fit, and only after proving that a regime-specific curve is actually better than the global fallback. The design accordingly treats regime curves as an upgrade that must earn their way in rather than a default that may be disabled.

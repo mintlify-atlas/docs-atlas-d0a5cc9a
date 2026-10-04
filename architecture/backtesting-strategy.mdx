@@ -1,7 +1,7 @@
 ---
 title: "Backtesting Strategy: Trajectory Collection and Replay"
 sidebarTitle: "Backtesting Strategy"
-description: "How the 24-hour trajectory collector (main.test.ts) and the strategy executor (main.strategy.ts) work together, including the dump format, generated level grids, and listener implementation."
+description: "Dump format, generated level grids, listener registration order, go/no-go separability check, and the two acknowledged coverage holes in the exit stack."
 ---
 
 The backtesting pipeline is split into two files with a strict division of labour. `main.test.ts` is the **trajectory collector**: it runs every signal as a 24-hour position with nothing allowed to close it early, so the engine writes a complete per-minute net PnL trajectory to the dump. `main.strategy.ts` is the **strategy executor**: it reads the calibrated level grids and applies them as listeners that fire exactly as they will in production. The collector produces the data that the calibration pipeline consumes; the strategy executor replays those calibrated curves and must reproduce every closure that the offline replay predicted.

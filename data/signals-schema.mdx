@@ -1,7 +1,7 @@
 ---
-title: "signals.jsonl: LLM-Extracted Signal Schema"
+title: "signals.jsonl Schema: LLM-Extracted Trading Signals"
 sidebarTitle: "signals.jsonl"
-description: "Complete field reference for the structured trading signal records in signals.jsonl, including the nested entry object with position, entryRange, targets, stoploss, and reasoning."
+description: "Complete field reference for signals.jsonl: top-level record, nested entry object, position enum, entryRange, targets, stoploss, and _context metadata."
 ---
 
 Each monthly folder under `content/<mon>_<year>/` may contain an `assets/signals.jsonl` file holding structured trading signals extracted from that month's raw posts. The file is produced by `generate-signals.mjs`, which streams `messages.jsonl`, applies a keyword pre-filter, then calls the `gemma4:31b-cloud` model (via Ollama and the `json-inference` library) once for each surviving (post, ticker) pair. The LLM is given the month's `prompt.mustache` template together with the post text, and is asked to fill the `TradingPositionFormat` JSON schema. The result is appended to `signals.jsonl` immediately, making the script safely resumable if interrupted.

@@ -1,7 +1,7 @@
 ---
-title: "generate-signals.mjs: Run the LLM Extraction"
+title: "generate-signals.mjs: LLM Signal Extraction Script"
 sidebarTitle: "generate-signals.mjs"
-description: "Reference for the per-month generate-signals.mjs script: how to run it, what it reads, what it writes, and how to run all 65 months in sequence or in parallel shards."
+description: "Reference for generate-signals.mjs: TradingPositionFormat schema, resumability, running one month or all 65 months in sequence or parallel shards."
 ---
 
 `generate-signals.mjs` is the core extraction script that lives inside each monthly content folder (e.g. `content/apr_2024/generate-signals.mjs`). It streams the month's raw Telegram posts from `assets/messages.jsonl`, applies a two-stage keyword pre-filter, extracts candidate tickers from hashtags, and calls a local Ollama LLM for every surviving (post, ticker) pair. Each LLM verdict is appended as a JSON line to `assets/signals.jsonl`. The script is fully resumable — already-processed pairs are silently skipped so a run can be interrupted and restarted without duplicating work.

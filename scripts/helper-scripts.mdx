@@ -1,7 +1,7 @@
 ---
 title: "Helper Scripts: Validate, Inspect, and Audit the Dataset"
 sidebarTitle: "Helper Scripts"
-description: "Reference for all helper scripts in the scripts/ directory: reading posts, validating prompts, checking candle coverage, filtering signals, and inspecting the LLM cache."
+description: "Inspect posts, audit the signal filter, validate the extraction prompt, check Binance candle coverage, and browse the MongoDB LLM cache — all read-only."
 ---
 
 The `scripts/` directory contains a set of focused utilities for inspecting, validating, and auditing the dataset at every stage of the pipeline. None of them modify `signals.jsonl` or `messages.jsonl` — they are read-only diagnostic and development tools. Reach for them when you are updating a prompt template, adding a new month, auditing ticker coverage, or debugging LLM inference results.
@@ -49,7 +49,7 @@ node scripts/fetch_photos.mjs                    # photos from last 40 posts
 node scripts/fetch_photos.mjs 10371 10369        # specific post IDs
 ```
 
-Photos are stored inline in `messages.jsonl` as base64-encoded JPEG strings in the `photo` field. This script fetches from the live channel (via `scrapePage`), decodes those strings, and writes them to the working directory as `photo_<id>.tmp.jpg`.
+The script fetches posts directly from the live channel via `scrapePage` (not from local `messages.jsonl`), then decodes the base64-encoded JPEG in the `photo` field and writes it to the working directory as `photo_<id>.tmp.jpg`. Posts without a photo are skipped with a note.
 
 ```text
 10371 saved photo_10371.tmp.jpg (text: Coin: #CHZUSDT ...)
@@ -63,7 +63,7 @@ Photos are stored inline in `messages.jsonl` as base64-encoded JPEG strings in t
 
 ## scripts/check_filter.mjs
 
-Find posts that look like genuine trading signals but are silently dropped by the keyword pre-filter — helping you identify gaps in the `ENTRY_RE` / `LEVELS_RE` regexes used by `generate-signals.mjs`.
+Find posts that look like genuine trading signals but are silently dropped by the keyword pre-filter — helping you identify gaps in the `ENTRY` / `LEVELS` regexes used by `generate-signals.mjs`.
 
 ```bash
 node scripts/check_filter.mjs
@@ -134,7 +134,7 @@ The script exits with code `1` if any case fails, `0` if all pass.
 
 ## scripts/read_months.mjs
 
-Scan all `signals.jsonl` files across every month, collect every ticker mentioned in signal posts, and cross-check them against the Binance spot market to identify which symbols are active, inactive, or missing entirely.
+Scan all `messages.jsonl` files across every month, collect every ticker mentioned in posts that contain both an `Entry:` and a `Stoploss` field, and cross-check them against the Binance spot market to identify which symbols are active, inactive, or missing entirely.
 
 ```bash
 node scripts/read_months.mjs
@@ -157,13 +157,13 @@ exists but inactive: 14 [...]
 
 ## scripts/check_candles.mjs
 
-Check 1-minute candle coverage on Binance spot for every ticker listed in `assets/target_tickers.txt`, over the full backtest range from 7 May 2021 to 30 September 2026. Reports which symbols have complete coverage, which have gaps, and which were listed or delisted mid-range.
+Check 1-minute candle coverage on Binance spot for every ticker listed in `config/loader.config.ts` (the parent `backtest-kit` project's loader configuration), over the full backtest range from 7 May 2021 to 30 September 2026. Reports which symbols have complete coverage, which have gaps, and which were listed or delisted mid-range.
 
 ```bash
 node scripts/check_candles.mjs
 ```
 
-The script reads the ticker list from `config/loader.config.ts` (the parent `backtest-kit` project's loader configuration), fetches daily OHLCV data for each symbol, and reports:
+The script reads the ticker list from `config/loader.config.ts`, fetches daily OHLCV data for each symbol from Binance, and reports:
 
 ```text
 FULL COVERAGE (82):
@@ -189,7 +189,7 @@ node scripts/read_cache.mjs
 node scripts/read_cache.mjs wallstreet_queen_entry_v1_4h_0
 ```
 
-With no arguments, the script prints a summary of all buckets:
+With no arguments, the script connects to `mongodb://localhost:27017/backtest-kit` and prints a summary of all buckets:
 
 ```text
 Buckets in measure-items:

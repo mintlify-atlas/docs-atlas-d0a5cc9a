@@ -1,7 +1,7 @@
 ---
 title: "Exit Calibration: Fitting Thresholds to PnL Trajectories"
 sidebarTitle: "Exit Calibration"
-description: "How exit thresholds—hard stop, PnL floor, profit lock, and trailing take—are calibrated against the population of 24-hour PnL trajectories using tangent replay and bisection."
+description: "How hard stop, PnL floor, profit lock, and trailing take are calibrated against 24-hour net PnL trajectories using tangent replay and bisection."
 ---
 
 The calibration philosophy is deliberate and narrow: take only direction and the moment of entry from the signal author, then replace everything else — targets, stop-loss, leverage sizing — with exits that are calibrated on how the channel's signals *actually* behaved. A published post is static and local; it is a set of numbers written before the market responded. The exits used in production are age-dependent functions estimated over the full ensemble of all signals from the channel. The author's skill at picking direction is measured and used; the author's risk-management is discarded and rebuilt from data.

@@ -1,7 +1,7 @@
 ---
-title: "fetch_messages.mjs: Scrape the Telegram Channel"
-sidebarTitle: "fetch_messages.mjs"
-description: "Scrape the WallstreetQueenOfficial Telegram channel day-by-day into per-month messages.jsonl files using telegram-reader. Requires a valid Telegram session."
+title: "fetch_messages.mjs: Scrape WallstreetQueen Channel"
+sidebarTitle: "fetch_messages"
+description: "Day-by-day scraper that populates per-month messages.jsonl files from WallstreetQueenOfficial using telegram-reader. Requires a valid Telegram session."
 ---
 
 `fetch_messages.mjs` is the data acquisition layer for the entire dataset. It walks through every calendar day in the configured date range, pulls that day's posts from the `WallstreetQueenOfficial` Telegram channel via `telegram-reader`, and writes them into per-month `messages.jsonl` files under `content/`. Everything downstream — signal extraction, backtesting, validation — ultimately depends on the files this script produces.
@@ -58,10 +58,10 @@ Step by step:
 4. **Progress logging.** After each day the script prints a timestamped summary to stdout:
 
    ```
-   [2025-01-15T10:23:41.002Z] 2024-04-03: +4 (total 4821)
+   [2025-01-15T10:23:41.002Z] 2024-04-03: +4 (всего 4821)
    ```
 
-   The format is `[ISO timestamp] YYYY-MM-DD: +N (total T)` where `+N` is the number of posts scraped that day and `T` is the running total.
+   The format is `[ISO timestamp] YYYY-MM-DD: +N (всего T)` where `+N` is the number of posts scraped that day and `T` is the running total.
 
 5. **Termination.** After the last day the final write stream is closed, a `готово: N постов` summary is printed, and `process.exit(0)` is called.
 
@@ -71,7 +71,7 @@ Step by step:
 node scripts/fetch_messages.mjs
 ```
 
-Run from the project root. The script has no CLI flags — the date range and channel name are hardcoded constants at the top of the file.
+Run from the project root. The script takes no CLI arguments — the date range and channel name are hardcoded constants at the top of the file.
 
 ## Output structure
 

@@ -1,7 +1,7 @@
 ---
 title: "Mustache Prompt Templates: Adapting to Post Format Changes"
 sidebarTitle: "Prompt Templates"
-description: "Each monthly folder carries its own prompt.mustache that encodes the post format rules for that period, with few-shot examples of signals, results posts, and non-signal messages."
+description: "Per-month prompt.mustache files encode post format rules and few-shot signal examples, letting each month use a prompt precisely calibrated to its era."
 ---
 
 Every monthly folder in `content/` contains its own `prompt.mustache` file. This is intentional: the WallstreetQueenOfficial channel's post format changed meaningfully several times over the dataset's five-year span (May 2021 – September 2026). Field names shifted (`Stoploss` → `Stop loss` → `Stop-loss`), header layouts evolved, and the vocabulary used for entry keywords drifted. Rather than trying to write a single universal prompt, each month carries a prompt that is precisely calibrated to the post format of that period, with few-shot examples drawn from actual posts of that time.
@@ -24,7 +24,7 @@ A `prompt.mustache` file contains the following elements, in order:
 
 The full `content/apr_2024/prompt.mustache`, shown exactly as it is stored:
 
-```text
+````text
 # Руководство
 
 Я провожу аудит торговых рекомендаций профессионального трейдера.
@@ -104,7 +104,7 @@ VIP ONLY (WALLSTREET QUEEN OFFICIAL)
 Аналитику, новости и чартовые обзоры без входа в позицию тоже фильтруй (wait).
 
 Шаблоны произвольные, общий вид такой
-```
+````
 
 ## Rendering
 

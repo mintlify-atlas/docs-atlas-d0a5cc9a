@@ -1,7 +1,7 @@
 ---
-title: "messages.jsonl: Raw Telegram Post Schema"
+title: "messages.jsonl Schema: Raw Telegram Post Reference"
 sidebarTitle: "messages.jsonl"
-description: "Field-by-field reference for the raw Telegram post records stored in each month's assets/messages.jsonl. Covers id, content, channel, date, and photo fields."
+description: "Field-by-field reference for raw channel post records in messages.jsonl: id, content, channel, ISO 8601 date, and optional base64 photo."
 ---
 
 Each monthly folder under `content/<mon>_<year>/` contains an `assets/messages.jsonl` file that holds every raw post scraped from the `WallstreetQueenOfficial` Telegram channel during that month. These files are the primary source of truth for the dataset: they are written once by `scripts/fetch_messages.mjs` and then consumed by `generate-signals.mjs` to produce the structured signal records. The files are stored in Git LFS — run `git lfs pull` after cloning before attempting to read them.
